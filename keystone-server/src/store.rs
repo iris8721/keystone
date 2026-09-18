@@ -21,7 +21,7 @@ pub struct SessionRecord {
     pub account: String,
     pub product: String,
     /// sha256 of the client-supplied HWID fingerprint. An anomaly
-    /// signal, not identity (DESIGN.md: assume spoofable) — and never
+    /// signal, not identity (README: assume spoofable) — and never
     /// the raw fingerprint, so the store can't be mined for hardware
     /// IDs.
     pub hwid_hash: [u8; 32],
@@ -32,6 +32,11 @@ pub struct SessionRecord {
     /// Sessions must not outlive the grant that created them —
     /// heartbeat kills the session once this passes.
     pub entitlement_expires_at: DateTime<Utc>,
+    /// sha256 of the client certificate the exchange was performed
+    /// with, recorded only when the account pins one. Every later
+    /// MAC'd request on this session must arrive over the same cert —
+    /// a lifted session key is useless without the install's identity.
+    pub cert_sha256: Option<[u8; 32]>,
     pub state: SessionState,
     /// Heartbeat nonces already accepted for this session — replay
     /// rejection for client-generated nonces.
@@ -50,6 +55,10 @@ impl fmt::Debug for SessionRecord {
             .field("hwid_hash", &self.hwid_hash)
             .field("session_key", &"[redacted]")
             .field("entitlement_expires_at", &self.entitlement_expires_at)
+            .field(
+                "cert_sha256",
+                &self.cert_sha256.map_or("absent", |_| "present"),
+            )
             .field("state", &self.state)
             .field("consumed", &self.consumed)
             .field("created_at", &self.created_at)
@@ -80,7 +89,7 @@ type FingerprintSighting = ([u8; 32], DateTime<Utc>);
 pub struct SessionStore {
     sessions: Arc<RwLock<HashMap<Uuid, SessionRecord>>>,
     /// account → (hwid_hash, last_seen). The anomaly signal from
-    /// DESIGN.md: same account presenting a materially different
+    /// README: same account presenting a materially different
     /// fingerprint inside a short window is worth flagging — never a
     /// hard gate, because facade exists and HWID is spoofable.
     fingerprints: Arc<RwLock<HashMap<String, FingerprintSighting>>>,
@@ -158,6 +167,26 @@ impl SessionStore {
         killed
     }
 
+    /// Kill every live session, whatever the account — the response to
+    /// a compromised issuer key (README: revoke the key AND
+    /// invalidate affected sessions). Returns how many were killed;
+    /// already-dead records keep their original reason.
+    pub fn revoke_all(&self, reason: DeadReason) -> usize {
+        let mut killed = 0;
+        for rec in self
+            .sessions
+            .write()
+            .expect("session store poisoned")
+            .values_mut()
+        {
+            if !matches!(rec.state, SessionState::Dead { .. }) {
+                rec.state.kill(reason);
+                killed += 1;
+            }
+        }
+        killed
+    }
+
     /// Reclaim records that can never matter again: sessions whose
     /// lease plus grace window has fully passed. Dead records are kept
     /// until then — dropping them early would turn "revoked" into
@@ -167,9 +196,7 @@ impl SessionStore {
             .write()
             .expect("session store poisoned")
             .retain(|_, rec| match &rec.state {
-                SessionState::Active { lease } => {
-                    now <= lease.expires_at + lease.grace_period
-                }
+                SessionState::Active { lease } => now <= lease.expires_at + lease.grace_period,
                 // The server is authoritative: it only ever creates
                 // Active or Dead — Grace is client-side bookkeeping.
                 // A Grace record here means the store was seeded from
@@ -192,7 +219,10 @@ impl SessionStore {
         now: DateTime<Utc>,
         window: chrono::Duration,
     ) -> bool {
-        let mut fps = self.fingerprints.write().expect("fingerprint cache poisoned");
+        let mut fps = self
+            .fingerprints
+            .write()
+            .expect("fingerprint cache poisoned");
         let anomalous = match fps.get(account) {
             Some((prev, seen)) => *prev != hwid_hash && now - *seen < window,
             None => false,

@@ -68,9 +68,8 @@ impl AccountFile {
         let text = std::fs::read_to_string(path).map_err(|e| {
             KeystoneError::Malformed(format!("accounts file {}: {e}", path.display()))
         })?;
-        serde_json::from_str(&text).map_err(|e| {
-            KeystoneError::Malformed(format!("accounts file {}: {e}", path.display()))
-        })
+        serde_json::from_str(&text)
+            .map_err(|e| KeystoneError::Malformed(format!("accounts file {}: {e}", path.display())))
     }
 
     /// Atomically replace the accounts file: write a uniquely-named
@@ -80,11 +79,17 @@ impl AccountFile {
     /// accounts". The temp name carries pid + random suffix so two
     /// concurrent saves can't collide on a fixed `.tmp`.
     pub fn save(&self, path: &Path) -> Result<(), KeystoneError> {
-        let text = serde_json::to_string_pretty(self).map_err(|e| {
-            KeystoneError::Malformed(format!("serializing accounts file: {e}"))
-        })?;
-        let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-        tmp_name.push(format!(".{}.{}.tmp", std::process::id(), Uuid::new_v4().simple()));
+        let text = serde_json::to_string_pretty(self)
+            .map_err(|e| KeystoneError::Malformed(format!("serializing accounts file: {e}")))?;
+        let mut tmp_name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
         let tmp: PathBuf = path.with_file_name(tmp_name);
 
         let write_result = (|| -> std::io::Result<()> {
@@ -102,9 +107,8 @@ impl AccountFile {
             )));
         }
 
-        std::fs::rename(&tmp, path).map_err(|e| {
-            KeystoneError::Malformed(format!("replacing {}: {e}", path.display()))
-        })?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| KeystoneError::Malformed(format!("replacing {}: {e}", path.display())))?;
 
         // Fsync the directory so the rename itself survives a crash.
         // Best-effort: Windows can't open a directory as a File, so

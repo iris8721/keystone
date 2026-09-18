@@ -3,7 +3,7 @@
 //! Every successful manifest issue and blob download appends one JSONL
 //! record. Accounts are recorded as HMAC-SHA256 pseudonyms under a
 //! server-held secret: attributable when the secret is known, anonymous
-//! when it isn't. Per DESIGN.md these records are supporting evidence
+//! when it isn't. Per README these records are supporting evidence
 //! for a leak investigation, not proof.
 
 use std::fs::{File, OpenOptions};

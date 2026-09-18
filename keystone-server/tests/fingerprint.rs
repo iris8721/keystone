@@ -10,7 +10,12 @@ fn same_fingerprint_is_not_anomalous() {
     let now = Utc::now();
     let hw = [1u8; 32];
     assert!(!store.check_fingerprint("alice", hw, now, Duration::minutes(10)));
-    assert!(!store.check_fingerprint("alice", hw, now + Duration::minutes(1), Duration::minutes(10)));
+    assert!(!store.check_fingerprint(
+        "alice",
+        hw,
+        now + Duration::minutes(1),
+        Duration::minutes(10)
+    ));
 }
 
 #[test]

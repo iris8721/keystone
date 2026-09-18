@@ -1,4 +1,4 @@
-//! Encrypted client→application handoff (DESIGN.md step 5).
+//! Encrypted client→application handoff (README step 5).
 //!
 //! The client seals the minimal session material into a blob and hands
 //! it to the application it launches; the app opens it and attests
@@ -21,14 +21,15 @@
 use std::fmt;
 
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, Payload},
 };
 use chrono::{DateTime, Duration, Utc};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{KeystoneError, Result};
 use crate::lease::Lease;
@@ -54,20 +55,23 @@ pub struct Handoff {
     pub ciphertext: Vec<u8>,
 }
 
-/// The plaintext inside the blob: exactly what the app needs to
-/// attest — session id, session key, current lease, and the pinned
-/// issuer key — and nothing else. No credentials, no logs.
-#[derive(Clone, Serialize, Deserialize)]
+/// The plaintext inside the blob: exactly what the app needs to attest — session id, session key,
+/// current lease, and the loader's observed server-minus-local clock drift — and nothing else: no
+/// credentials, no logs, and no issuer key, because the app bakes its own `TrustedIssuers` and the
+/// loader is never a source of trust.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct HandoffPayload {
+    #[zeroize(skip)]
     pub session_id: Uuid,
     #[serde(with = "serde_big_array::BigArray")]
     pub session_key: [u8; 32],
+    #[zeroize(skip)]
     pub lease: Lease,
-    /// The issuer verifying key the app must pin. Carried in the blob
-    /// so the sealed material is self-contained — the app never has
-    /// to trust a key the client passes unauthenticated.
-    #[serde(with = "serde_big_array::BigArray")]
-    pub server_pubkey: [u8; 32],
+    // Both processes share the machine clock, so inheriting the loader's
+    // drift puts the app's very first timestamped request inside the
+    // server's freshness window even on a skewed host.
+    #[serde(default)]
+    pub clock_drift_millis: i64,
 }
 
 /// Stretch the launch-channel secret into the AEAD key. `process_id`
@@ -189,7 +193,10 @@ impl fmt::Debug for Handoff {
             .field("nonce", &self.nonce)
             .field("issued_at", &self.issued_at)
             .field("ttl", &self.ttl)
-            .field("ciphertext", &format_args!("[{} bytes]", self.ciphertext.len()))
+            .field(
+                "ciphertext",
+                &format_args!("[{} bytes]", self.ciphertext.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -202,7 +209,6 @@ impl fmt::Debug for HandoffPayload {
             .field("session_id", &self.session_id)
             .field("session_key", &"[redacted]")
             .field("lease", &self.lease)
-            .field("server_pubkey", &self.server_pubkey)
             .finish_non_exhaustive()
     }
 }
@@ -224,7 +230,7 @@ mod tests {
                 expires_at: Utc::now() + Duration::seconds(300),
                 grace_period: Duration::seconds(60),
             },
-            server_pubkey: [0x77; 32],
+            clock_drift_millis: 0,
         }
     }
 
@@ -234,7 +240,26 @@ mod tests {
         let opened = blob.open(&KEY, PROCESS, Utc::now()).unwrap();
         assert_eq!(opened.session_id, Uuid::nil());
         assert_eq!(opened.session_key, [0xAB; 32]);
-        assert_eq!(opened.server_pubkey, [0x77; 32]);
+        assert_eq!(opened.lease.grace_period, Duration::seconds(60));
+    }
+
+    #[test]
+    fn payload_wire_form_carries_no_issuer_key() {
+        // The loader must never be able to hand the app a trust root:
+        // the serialized payload has exactly the attest fields plus the
+        // loader's observed drift — no pubkey, no credentials.
+        let json = serde_json::to_value(payload()).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["clock_drift_millis", "lease", "session_id", "session_key"]
+        );
     }
 
     #[test]
@@ -342,4 +367,3 @@ mod tests {
         ));
     }
 }
-

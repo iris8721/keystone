@@ -40,12 +40,22 @@ fn add_grant_list_revoke_roundtrip() {
     let text = std::fs::read_to_string(&file).unwrap();
     // The file holds an argon2 PHC string — never the plaintext secret.
     assert!(text.contains("$argon2"), "expected argon2 hash in {text}");
-    assert!(!text.contains("s3cret"), "plaintext secret leaked into {text}");
+    assert!(
+        !text.contains("s3cret"),
+        "plaintext secret leaked into {text}"
+    );
 
     let out = account(
         &dir,
         &[
-            "grant", "alice", "--product", "prod-x", "--days", "30", "--features", "aim,esp",
+            "grant",
+            "alice",
+            "--product",
+            "prod-x",
+            "--days",
+            "30",
+            "--features",
+            "aim,esp",
         ],
     );
     assert!(out.status.success(), "grant failed: {out:?}");
@@ -54,7 +64,10 @@ fn add_grant_list_revoke_roundtrip() {
     assert!(out.status.success(), "list failed: {out:?}");
     let listing = stdout(&out);
     assert!(listing.contains("alice"), "list missing account: {listing}");
-    assert!(listing.contains("prod-x"), "list missing product: {listing}");
+    assert!(
+        listing.contains("prod-x"),
+        "list missing product: {listing}"
+    );
     assert!(listing.contains("aim"), "list missing features: {listing}");
     // Hashes and secrets are operator-invisible.
     assert!(!listing.contains("$argon2"), "list leaked hash: {listing}");
@@ -74,7 +87,11 @@ fn add_grant_list_revoke_roundtrip() {
 #[test]
 fn add_refuses_to_clobber_existing_account() {
     let dir = workdir();
-    assert!(account(&dir, &["add", "alice", "--secret", "one"]).status.success());
+    assert!(
+        account(&dir, &["add", "alice", "--secret", "one"])
+            .status
+            .success()
+    );
     let out = account(&dir, &["add", "alice", "--secret", "two"]);
     assert!(!out.status.success(), "duplicate add must fail");
     // The original account is untouched.
@@ -108,7 +125,10 @@ fn add_prompts_for_secret_when_flag_absent() {
     assert!(out.status.success(), "prompted add failed: {out:?}");
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(text.contains("$argon2"), "expected argon2 hash in {text}");
-    assert!(!text.contains("piped-secret"), "plaintext secret leaked into {text}");
+    assert!(
+        !text.contains("piped-secret"),
+        "plaintext secret leaked into {text}"
+    );
 }
 
 #[test]
@@ -126,7 +146,11 @@ fn add_with_secret_flag_warns_about_argv() {
 #[test]
 fn revoke_missing_grant_fails_loudly() {
     let dir = workdir();
-    assert!(account(&dir, &["add", "alice", "--secret", "s3cret"]).status.success());
+    assert!(
+        account(&dir, &["add", "alice", "--secret", "s3cret"])
+            .status
+            .success()
+    );
     let out = account(&dir, &["revoke", "alice", "--product", "never-granted"]);
     assert!(
         !out.status.success(),
@@ -137,7 +161,11 @@ fn revoke_missing_grant_fails_loudly() {
 #[test]
 fn cert_without_ca_material_errors() {
     let dir = workdir();
-    assert!(account(&dir, &["add", "alice", "--secret", "s3cret"]).status.success());
+    assert!(
+        account(&dir, &["add", "alice", "--secret", "s3cret"])
+            .status
+            .success()
+    );
     let out = account(&dir, &["cert", "alice"]);
     assert!(!out.status.success(), "cert without a CA must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -179,7 +207,11 @@ fn cert_with_ca_records_cert_sha256() {
     let cert_pem = root.join(format!("{name}-cert.pem"));
     let key_pem = root.join(format!("{name}-key.pem"));
 
-    assert!(account(&dir, &["add", &name, "--secret", "s3cret"]).status.success());
+    assert!(
+        account(&dir, &["add", &name, "--secret", "s3cret"])
+            .status
+            .success()
+    );
     let file = dir.join("accounts.json");
     let out = {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_xtask"));
@@ -223,7 +255,10 @@ fn cert_with_ca_records_cert_sha256() {
 fn cert_on_nonexistent_account_errors() {
     let dir = workdir();
     let out = account(&dir, &["cert", "ghost"]);
-    assert!(!out.status.success(), "cert for a missing account must fail");
+    assert!(
+        !out.status.success(),
+        "cert for a missing account must fail"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("ghost"),
@@ -236,7 +271,11 @@ fn cert_on_nonexistent_account_errors() {
 #[test]
 fn grant_rejects_nonpositive_days() {
     let dir = workdir();
-    assert!(account(&dir, &["add", "alice", "--secret", "s3cret"]).status.success());
+    assert!(
+        account(&dir, &["add", "alice", "--secret", "s3cret"])
+            .status
+            .success()
+    );
     for days in ["0", "-7"] {
         let out = account(
             &dir,

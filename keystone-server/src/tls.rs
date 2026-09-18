@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::io;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -36,7 +37,10 @@ pub struct PeerCertificates(pub Arc<Vec<CertificateDer<'static>>>);
 /// sha256 of the leaf certificate's DER — the value the account file's
 /// `cert_sha256` field pins against.
 pub fn peer_cert_sha256(peers: &PeerCertificates) -> Option<[u8; 32]> {
-    peers.0.first().map(|leaf| Sha256::digest(leaf.as_ref()).into())
+    peers
+        .0
+        .first()
+        .map(|leaf| Sha256::digest(leaf.as_ref()).into())
 }
 
 /// Compare a presented cert hash against the account's pinned hash in
@@ -44,6 +48,62 @@ pub fn peer_cert_sha256(peers: &PeerCertificates) -> Option<[u8; 32]> {
 /// not become a timing oracle for partial matches.
 pub fn cert_hash_matches(presented: &[u8; 32], pinned: &[u8; 32]) -> bool {
     presented.ct_eq(pinned).into()
+}
+
+/// How the server will listen, decided once at startup from the TLS
+/// environment. Only `MutualTls` is a production configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportMode {
+    /// TLS with client certificates required — the only mode that
+    /// gives the cert_sha256 account binding anything to bind to.
+    MutualTls {
+        cert: PathBuf,
+        key: PathBuf,
+        ca: PathBuf,
+    },
+    /// TLS without client auth. Dev only.
+    TlsOnly { cert: PathBuf, key: PathBuf },
+    /// Cleartext HTTP. Dev only — real clients refuse it.
+    Plain,
+}
+
+/// The env var that unlocks the two insecure modes.
+pub const ALLOW_INSECURE_VAR: &str = "KEYSTONE_ALLOW_INSECURE";
+
+/// Decide the transport from `KEYSTONE_TLS_CERT` / `KEYSTONE_TLS_KEY` / `KEYSTONE_CA_CERT`;
+/// anything short of mTLS is refused unless `is_insecure_allowed`, and a half-configured cert/key
+/// pair is always refused because silently downgrading would hide the misconfiguration.
+pub fn transport_mode(
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    ca_cert: Option<PathBuf>,
+    is_insecure_allowed: bool,
+) -> Result<TransportMode, String> {
+    let (cert, key) =
+        match (tls_cert, tls_key) {
+            (Some(cert), Some(key)) => (cert, key),
+            (None, None) => {
+                if !is_insecure_allowed {
+                    return Err(format!(
+                        "no KEYSTONE_TLS_CERT/KEYSTONE_TLS_KEY — plain HTTP is insecure; \
+                     set {ALLOW_INSECURE_VAR}=1 to run without TLS anyway"
+                    ));
+                }
+                return Ok(TransportMode::Plain);
+            }
+            _ => return Err(
+                "KEYSTONE_TLS_CERT and KEYSTONE_TLS_KEY must be set together — refusing to start"
+                    .to_string(),
+            ),
+        };
+    match ca_cert {
+        Some(ca) => Ok(TransportMode::MutualTls { cert, key, ca }),
+        None if is_insecure_allowed => Ok(TransportMode::TlsOnly { cert, key }),
+        None => Err(format!(
+            "no KEYSTONE_CA_CERT — TLS without client certificates is insecure; \
+             set {ALLOW_INSECURE_VAR}=1 to run without mTLS anyway"
+        )),
+    }
 }
 
 /// Build the server's TLS config from PEM files.
@@ -68,9 +128,11 @@ pub fn load_rustls_config(
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &key_pem[..])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "no private key in server key PEM")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no private key in server key PEM",
+            )
         })?;
-
 
     // Explicit provider: the workspace enables both ring and
     // aws-lc-rs on rustls (via reqwest and axum-server), so the
@@ -82,10 +144,9 @@ pub fn load_rustls_config(
     let builder = match ca_cert_pem {
         Some(ca_pem) => {
             let mut roots = RootCertStore::empty();
-            let ca_certs: Vec<CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut &ca_pem[..])
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &ca_pem[..])
+                .collect::<Result<_, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if ca_certs.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -97,17 +158,14 @@ pub fn load_rustls_config(
                     io::Error::new(io::ErrorKind::InvalidData, format!("bad CA cert: {e}"))
                 })?;
             }
-            let verifier = WebPkiClientVerifier::builder_with_provider(
-                Arc::new(roots),
-                provider,
-            )
-            .build()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("client cert verifier: {e}"),
-                )
-            })?;
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("client cert verifier: {e}"),
+                    )
+                })?;
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
@@ -146,8 +204,7 @@ where
 {
     type Stream = TlsStream<TcpStream>;
     type Service = PeerCertService<S>;
-    type Future =
-        Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let future = self.inner.accept(stream, service);
@@ -262,9 +319,7 @@ pub fn subject_common_name(subject_der: &[u8]) -> Option<String> {
                 // UTF8String / PrintableString / IA5String / T61String
                 // (T61 treated as Latin-1 — CN values are ASCII in
                 // practice and this only feeds an equality check).
-                0x0c | 0x13 | 0x16 | 0x14 => {
-                    Some(String::from_utf8_lossy(val).into_owned())
-                }
+                0x0c | 0x13 | 0x16 | 0x14 => Some(String::from_utf8_lossy(val).into_owned()),
                 // BMPString is UTF-16BE.
                 0x1e => {
                     let units: Vec<u16> = val

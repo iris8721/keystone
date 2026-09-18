@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use chrono::{Duration, Utc};
 use keystone_core::{AccountFile, AccountGrant, AccountRecord, EntitlementSource};
 use keystone_server::accounts::LocalAccounts;
@@ -72,7 +72,11 @@ async fn good_credentials_authenticate_and_grant() {
     let identity = backend.authenticate(ACCOUNT, SECRET).await.unwrap();
     assert_eq!(identity.unwrap().account, ACCOUNT);
 
-    let grant = backend.entitlement(ACCOUNT, PRODUCT).await.unwrap().unwrap();
+    let grant = backend
+        .entitlement(ACCOUNT, PRODUCT)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(grant.account, ACCOUNT);
     assert_eq!(grant.product, PRODUCT);
     assert_eq!(grant.features, vec!["aim", "esp"]);
@@ -92,7 +96,13 @@ async fn bad_secret_denies() {
         },
     );
     let backend = LocalAccounts::open(path);
-    assert!(backend.authenticate(ACCOUNT, "wrong").await.unwrap().is_none());
+    assert!(
+        backend
+            .authenticate(ACCOUNT, "wrong")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -138,8 +148,20 @@ async fn expired_grant_authorizes_nothing() {
     let backend = LocalAccounts::open(path);
     // Credentials still prove identity — expiry is an authorization
     // failure, not an authentication one.
-    assert!(backend.authenticate(ACCOUNT, SECRET).await.unwrap().is_some());
-    assert!(backend.entitlement(ACCOUNT, PRODUCT).await.unwrap().is_none());
+    assert!(
+        backend
+            .authenticate(ACCOUNT, SECRET)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .entitlement(ACCOUNT, PRODUCT)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -165,7 +187,13 @@ async fn file_edits_are_picked_up_without_restart() {
     let dir = workdir();
     let path = write_accounts(&dir, &AccountFile { accounts: vec![] });
     let backend = LocalAccounts::open(path.clone());
-    assert!(backend.authenticate(ACCOUNT, SECRET).await.unwrap().is_none());
+    assert!(
+        backend
+            .authenticate(ACCOUNT, SECRET)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Rewrite the file with the account added, and bump the mtime past
     // the previous write — filesystems with coarse mtime granularity
@@ -186,8 +214,20 @@ async fn file_edits_are_picked_up_without_restart() {
         .set_modified(SystemTime::now() + StdDuration::from_secs(5))
         .unwrap();
 
-    assert!(backend.authenticate(ACCOUNT, SECRET).await.unwrap().is_some());
-    assert!(backend.entitlement(ACCOUNT, PRODUCT).await.unwrap().is_some());
+    assert!(
+        backend
+            .authenticate(ACCOUNT, SECRET)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .entitlement(ACCOUNT, PRODUCT)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -246,7 +286,12 @@ async fn corrupt_secret_hash_is_a_backend_error() {
     let dir = workdir();
     let mut rec = record(ACCOUNT, SECRET, vec![]);
     rec.secret_hash = "not-an-argon2-phc-string".into();
-    let path = write_accounts(&dir, &AccountFile { accounts: vec![rec] });
+    let path = write_accounts(
+        &dir,
+        &AccountFile {
+            accounts: vec![rec],
+        },
+    );
     let backend = LocalAccounts::open(path);
 
     assert!(

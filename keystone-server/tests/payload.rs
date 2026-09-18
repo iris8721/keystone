@@ -2,24 +2,25 @@
 //! artifact key) and GET /payload/{product}/{version} (the sealed
 //! blob), plus every rejection the session gate must produce.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
+use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use keystone_core::{
-    artifact_context, artifact_key_for, decrypt_artifact, mac_heartbeat, mac_response,
-    seal_artifact, unwrap_artifact_key, Entitlement, Envelope, Expectation, Issuer, KeystoneError,
-    KeyWrap, SessionState, SignedManifest,
+    Entitlement, Envelope, Expectation, Issuer, KeyWrap, KeystoneError, RequestBinding,
+    SessionState, SignedManifest, TrustedIssuers, artifact_context, artifact_key_for,
+    decrypt_artifact, mac_request, seal_artifact, unwrap_artifact_key,
 };
 use keystone_server::downloads::DownloadLog;
 use keystone_server::entitlement::StubEntitlementSource;
-use keystone_server::state::{ArtifactHashes, ChallengeBook, RateLimiter, RateLimits};
-use keystone_server::{build_router, AppState, SessionStore};
-use hmac::{Hmac, Mac};
-use serde_json::{json, Value};
+use keystone_server::state::{ArtifactHashes, RateLimiter, RateLimits};
+use keystone_server::{AppState, SessionStore, build_router};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -30,6 +31,11 @@ const PRODUCT: &str = "dev-product";
 const VERSION: &str = "1.0.0";
 const PAYLOAD_BYTES: &[u8] = b"keystone test payload blob";
 const PAYLOAD_SECRET: [u8; 32] = [0x5Au8; 32];
+/// The server's live payload epoch — what artifacts are sealed under.
+const EPOCH: u32 = 0;
+/// The epoch both sides fix the payload MAC bodies to (the client
+/// can't know the live one before the manifest arrives).
+const MAC_EPOCH: u32 = 0;
 
 fn test_state(payload_dir: Option<PathBuf>) -> AppState {
     test_state_full(payload_dir, Some(PAYLOAD_SECRET))
@@ -47,29 +53,34 @@ fn test_state_full(payload_dir: Option<PathBuf>, secret: Option<[u8; 32]>) -> Ap
         }],
     )]));
     AppState {
-        issuer: Arc::new(Issuer::from_bytes(&[7u8; 32])),
+        issuer: Arc::new(Issuer::from_seed(&[7u8; 32], 1)),
         store: SessionStore::new(),
         entitlements,
-        challenges: Arc::new(ChallengeBook::new()),
         admin_token_hash: None,
-        challenge_ttl: Duration::seconds(60),
         lease_ttl: Duration::seconds(300),
         grace_period: Duration::seconds(60),
         payload_dir,
         payload_secret: secret,
+        payload_epoch: EPOCH,
         downloads: None,
         watermark_secret: None,
         rate_limits: RateLimits::default(),
         rate_limiter: Arc::new(RateLimiter::new()),
         artifact_hashes: Arc::new(ArtifactHashes::new()),
+        revoked_key_ids: Arc::new(RwLock::new(BTreeSet::new())),
     }
+}
+
+/// The trust root a client of this server would bake in.
+fn issuers(state: &AppState) -> TrustedIssuers {
+    TrustedIssuers::single(state.issuer.key_id(), state.issuer.verifying_key())
 }
 
 /// A payload dir holding the sealed release blob for product-version.
 fn payload_dir_with(product: &str, version: &str, plaintext: &[u8]) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("keystone-payload-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let context = artifact_context(product, version);
+    let context = artifact_context(product, version, EPOCH);
     let sealed = seal_artifact(&PAYLOAD_SECRET, &context, plaintext).unwrap();
     std::fs::write(dir.join(format!("{product}-{version}.bin")), sealed).unwrap();
     dir
@@ -133,11 +144,10 @@ struct Session {
     key: [u8; 32],
 }
 
-/// Run challenge + exchange against the dev account.
+/// Exchange against the dev account with a client-minted nonce.
 async fn establish_session(app: &axum::Router) -> Session {
-    let (status, ch) = post(app, "/challenge", json!({})).await;
-    assert_eq!(status, StatusCode::OK);
-    let nonce = arr32(&ch, "nonce");
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
     let (status, body) = post(
         app,
         "/exchange",
@@ -159,27 +169,57 @@ async fn establish_session(app: &axum::Router) -> Session {
     }
 }
 
-/// A well-formed POST /payload request for product:version.
+/// A well-formed POST /payload request for product:version, stamped
+/// with the current time.
 fn fetch_req(session: &Session, product: &str, version: &str, nonce: [u8; 32]) -> Value {
-    let mac_body = [b"payload.fetch:".as_slice(), &artifact_context(product, version)].concat();
-    let mac = mac_response(&session.key, &nonce, &mac_body);
+    let issued_at = Utc::now();
+    let mac_body = [
+        b"payload.fetch:".as_slice(),
+        &artifact_context(product, version, MAC_EPOCH),
+    ]
+    .concat();
+    let mac = mac_request(
+        &session.key,
+        &RequestBinding {
+            session_id: &session.id,
+            nonce: &nonce,
+            issued_at,
+            context: &mac_body,
+        },
+    );
     json!({
         "session_id": session.id,
         "product": product,
         "version": version,
         "nonce": nonce,
+        "issued_at": issued_at,
         "mac": mac,
     })
 }
 
-/// The Authorization header GET /payload expects.
+/// The Authorization header GET /payload expects:
+/// `Keystone <session_id>:<nonce_hex>:<issued_at_ms>:<mac_hex>`.
 fn blob_auth(session: &Session, product: &str, version: &str, nonce: [u8; 32]) -> String {
-    let mac_body = [b"payload.download:".as_slice(), &artifact_context(product, version)].concat();
-    let mac = mac_response(&session.key, &nonce, &mac_body);
+    let issued_at = Utc::now();
+    let mac_body = [
+        b"payload.download:".as_slice(),
+        &artifact_context(product, version, MAC_EPOCH),
+    ]
+    .concat();
+    let mac = mac_request(
+        &session.key,
+        &RequestBinding {
+            session_id: &session.id,
+            nonce: &nonce,
+            issued_at,
+            context: &mac_body,
+        },
+    );
     format!(
-        "Keystone {}:{}:{}",
+        "Keystone {}:{}:{}:{}",
         session.id,
         hex::encode(nonce),
+        issued_at.timestamp_millis(),
         hex::encode(mac)
     )
 }
@@ -202,7 +242,7 @@ async fn payload_fetch_happy_path() {
 
     let env: Envelope = serde_json::from_value(body).unwrap();
     env.verify(
-        &state.issuer.verifying_key(),
+        &issuers(&state),
         &Expectation {
             challenge: &nonce,
             session_id: &session.id,
@@ -214,10 +254,9 @@ async fn payload_fetch_happy_path() {
     .expect("payload envelope must verify");
 
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
     let manifest = signed
-        .verify(&state.issuer.verifying_key(), Utc::now())
+        .verify(&issuers(&state), Utc::now())
         .expect("manifest must verify");
     assert_eq!(manifest.product, PRODUCT);
     assert_eq!(manifest.version, VERSION);
@@ -230,8 +269,7 @@ async fn payload_fetch_happy_path() {
 
     // The wrap opens only under this session's key + this request's
     // nonce — a captured wrap is dead material anywhere else.
-    let wrap: KeyWrap =
-        serde_json::from_value(body_json["payload_key_wrap"].clone()).unwrap();
+    let wrap: KeyWrap = serde_json::from_value(body_json["payload_key_wrap"].clone()).unwrap();
     let artifact_key = unwrap_artifact_key(&session.key, &nonce, &wrap)
         .expect("wrap must open under the session key");
     // And the unwrapped key actually decrypts the sealed blob.
@@ -241,7 +279,7 @@ async fn payload_fetch_happy_path() {
     // The same key is derivable server-side from the artifact secret.
     let expected = artifact_key_for(
         &PAYLOAD_SECRET,
-        &artifact_context(PRODUCT, VERSION),
+        &artifact_context(PRODUCT, VERSION, EPOCH),
         &sealed,
     )
     .unwrap();
@@ -263,11 +301,16 @@ async fn payload_fetch_wrong_mac_rejected() {
             "product": PRODUCT,
             "version": VERSION,
             "nonce": vec![7u8; 32],
+            "issued_at": Utc::now(),
             "mac": vec![0u8; 32],
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "bad MAC must be 401: {body}");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "bad MAC must be 401: {body}"
+    );
 }
 
 #[tokio::test]
@@ -285,7 +328,11 @@ async fn payload_fetch_dead_session_rejected() {
     )
     .await;
     // A valid MAC must never resurrect a revoked session.
-    assert_eq!(status, StatusCode::FORBIDDEN, "dead session must be 403: {body}");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "dead session must be 403: {body}"
+    );
 }
 
 #[tokio::test]
@@ -298,10 +345,19 @@ async fn payload_fetch_wrong_product_rejected() {
     // A MAC minted for dev-product can't be transplanted onto another
     // product — the MAC body binds product:version.
     let nonce = [0x42u8; 32];
-    let mac = mac_response(
+    let issued_at = Utc::now();
+    let mac = mac_request(
         &session.key,
-        &nonce,
-        &[b"payload.fetch:".as_slice(), &artifact_context(PRODUCT, VERSION)].concat(),
+        &RequestBinding {
+            session_id: &session.id,
+            nonce: &nonce,
+            issued_at,
+            context: &[
+                b"payload.fetch:".as_slice(),
+                &artifact_context(PRODUCT, VERSION, MAC_EPOCH),
+            ]
+            .concat(),
+        },
     );
     let (status, body) = post(
         &app,
@@ -311,11 +367,16 @@ async fn payload_fetch_wrong_product_rejected() {
             "product": "other-product",
             "version": VERSION,
             "nonce": nonce,
+            "issued_at": issued_at,
             "mac": mac,
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "transplanted MAC must be 401: {body}");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "transplanted MAC must be 401: {body}"
+    );
 
     // A correctly-bound MAC for a product the account isn't entitled
     // to is a denial, not a forgery.
@@ -325,7 +386,11 @@ async fn payload_fetch_wrong_product_rejected() {
         fetch_req(&session, "other-product", VERSION, [0x43u8; 32]),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "unentitled product must be 403: {body}");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "unentitled product must be 403: {body}"
+    );
 }
 
 #[tokio::test]
@@ -403,11 +468,20 @@ async fn payload_fetch_replay_survives_lease_renewal() {
     // Renew the lease — the consumed nonce must outlive the rolling
     // lease window or the captured MAC replays after every heartbeat.
     let hb_nonce = [0x77u8; 32];
-    let hb_mac = mac_heartbeat(&session.key, &session.id, &hb_nonce);
+    let hb_issued_at = Utc::now();
+    let hb_mac = mac_request(
+        &session.key,
+        &RequestBinding {
+            session_id: &session.id,
+            nonce: &hb_nonce,
+            issued_at: hb_issued_at,
+            context: b"heartbeat",
+        },
+    );
     let (status, body) = post(
         &app,
         "/heartbeat",
-        json!({"session_id": session.id, "nonce": hb_nonce, "mac": hb_mac}),
+        json!({"session_id": session.id, "nonce": hb_nonce, "issued_at": hb_issued_at, "mac": hb_mac}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "heartbeat failed: {body}");
@@ -539,7 +613,7 @@ async fn payload_blob_download_and_auth() {
     assert_ne!(bytes, PAYLOAD_BYTES, "blob must be sealed on the wire");
     let key = artifact_key_for(
         &PAYLOAD_SECRET,
-        &artifact_context(PRODUCT, VERSION),
+        &artifact_context(PRODUCT, VERSION, EPOCH),
         &bytes,
     )
     .unwrap();
@@ -583,6 +657,47 @@ async fn payload_blob_download_and_auth() {
     assert_eq!(body["code"], "artifact_not_found");
 }
 
+/// The download header carries `issued_at` as its third segment. The
+/// pre-timestamp three-segment shape is not accepted — the stamp is
+/// part of the contract, not an optional extra — and the four-segment
+/// shape is what serves the blob.
+#[tokio::test]
+async fn payload_download_header_carries_issued_at() {
+    let dir = payload_dir_with(PRODUCT, VERSION, PAYLOAD_BYTES);
+    let state = test_state(Some(dir));
+    let app = build_router(state);
+    let session = establish_session(&app).await;
+    let path = format!("/payload/{PRODUCT}/{VERSION}");
+    let mac_body = [
+        b"payload.download:".as_slice(),
+        &artifact_context(PRODUCT, VERSION, MAC_EPOCH),
+    ]
+    .concat();
+
+    let nonce = [0xAEu8; 32];
+    let mac = mac_request(
+        &session.key,
+        &RequestBinding {
+            session_id: &session.id,
+            nonce: &nonce,
+            issued_at: Utc::now(),
+            context: &mac_body,
+        },
+    );
+    let legacy = format!(
+        "Keystone {}:{}:{}",
+        session.id,
+        hex::encode(nonce),
+        hex::encode(mac)
+    );
+    let (status, _) = request(&app, "GET", &path, Some(legacy), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let auth = blob_auth(&session, PRODUCT, VERSION, [0xAFu8; 32]);
+    let (status, _) = request(&app, "GET", &path, Some(auth), None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn tampered_manifest_signature_fails_verification() {
     let dir = payload_dir_with(PRODUCT, VERSION, PAYLOAD_BYTES);
@@ -599,14 +714,11 @@ async fn tampered_manifest_signature_fails_verification() {
     assert_eq!(status, StatusCode::OK);
     let env: Envelope = serde_json::from_value(body).unwrap();
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let mut signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let mut signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
 
     // Flip a bit the signature covers — verification must fail.
     signed.manifest.version = "9.9.9".to_string();
-    let err = signed
-        .verify(&state.issuer.verifying_key(), Utc::now())
-        .unwrap_err();
+    let err = signed.verify(&issuers(&state), Utc::now()).unwrap_err();
     assert!(matches!(err, KeystoneError::InvalidSignature));
 }
 
@@ -633,10 +745,9 @@ async fn served_manifest_carries_build_id() {
     assert_eq!(status, StatusCode::OK);
     let env: Envelope = serde_json::from_value(body).unwrap();
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
     let manifest = signed
-        .verify(&state.issuer.verifying_key(), Utc::now())
+        .verify(&issuers(&state), Utc::now())
         .expect("manifest must verify");
     assert_eq!(manifest.build_id, "release-2026-09");
 }
@@ -705,7 +816,6 @@ async fn download_log_records_fetch_and_blob() {
     assert_ne!(pseudonym, hex::encode(mac.finalize().into_bytes()));
 }
 
-
 /// Every manifest fetch gets a fresh signed download_id — the
 /// watermark that ties a leaked manifest back to one download.
 #[tokio::test]
@@ -727,12 +837,11 @@ async fn manifest_download_id_is_per_request_and_signed() {
         assert_eq!(status, StatusCode::OK, "fetch failed: {body}");
         let env: Envelope = serde_json::from_value(body).unwrap();
         let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-        let signed: SignedManifest =
-            serde_json::from_value(body_json["manifest"].clone()).unwrap();
+        let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
         // The id is inside the signature — verify() passing means the
         // download_id is attested, not just present.
         let manifest = signed
-            .verify(&state.issuer.verifying_key(), Utc::now())
+            .verify(&issuers(&state), Utc::now())
             .expect("manifest must verify");
         assert_eq!(manifest.download_id.len(), 64, "download_id is hex sha256");
         ids.push(manifest.download_id.clone());
@@ -773,10 +882,9 @@ async fn sha256_sidecar_skips_decrypt() {
     assert_eq!(status, StatusCode::OK, "sidecar fetch failed: {body}");
     let env: Envelope = serde_json::from_value(body).unwrap();
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
     let manifest = signed
-        .verify(&state.issuer.verifying_key(), Utc::now())
+        .verify(&issuers(&state), Utc::now())
         .expect("manifest must verify");
     assert_eq!(manifest.sha256, plaintext_hash);
 }
@@ -825,10 +933,9 @@ async fn plaintext_hash_cached_by_mtime() {
     assert_eq!(status, StatusCode::OK, "cached fetch failed: {body}");
     let env: Envelope = serde_json::from_value(body).unwrap();
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
     let manifest = signed
-        .verify(&state.issuer.verifying_key(), Utc::now())
+        .verify(&issuers(&state), Utc::now())
         .expect("manifest must verify");
     manifest.verify_payload(PAYLOAD_BYTES).unwrap();
 }
@@ -846,19 +953,54 @@ async fn payload_blob_malformed_auth_headers_rejected() {
 
     let nonce_hex = hex::encode([0xABu8; 32]);
     let mac_hex = hex::encode([0xCDu8; 32]);
+    let ms = Utc::now().timestamp_millis();
     let cases = [
         // Wrong scheme.
-        format!("Bearer {}:{}:{}", session.id, nonce_hex, mac_hex),
+        format!("Bearer {}:{}:{}:{}", session.id, nonce_hex, ms, mac_hex),
         // Missing scheme entirely.
-        format!("{}:{}:{}", session.id, nonce_hex, mac_hex),
+        format!("{}:{}:{}:{}", session.id, nonce_hex, ms, mac_hex),
         // Extra colon-separated field.
-        format!("Keystone {}:{}:{}:extra", session.id, nonce_hex, mac_hex),
+        format!(
+            "Keystone {}:{}:{}:{}:extra",
+            session.id, nonce_hex, ms, mac_hex
+        ),
         // Short hex for the nonce (31 bytes).
-        format!("Keystone {}:{}:{}", session.id, &nonce_hex[..62], mac_hex),
+        format!(
+            "Keystone {}:{}:{}:{}",
+            session.id,
+            &nonce_hex[..62],
+            ms,
+            mac_hex
+        ),
         // Short hex for the MAC.
-        format!("Keystone {}:{}:{}", session.id, nonce_hex, &mac_hex[..62]),
+        format!(
+            "Keystone {}:{}:{}:{}",
+            session.id,
+            nonce_hex,
+            ms,
+            &mac_hex[..62]
+        ),
         // Non-hex nonce.
-        format!("Keystone {}:{}:{}", session.id, "zz".repeat(32), mac_hex),
+        format!(
+            "Keystone {}:{}:{}:{}",
+            session.id,
+            "zz".repeat(32),
+            ms,
+            mac_hex
+        ),
+        // Non-numeric timestamp.
+        format!(
+            "Keystone {}:{}:{}:{}",
+            session.id, nonce_hex, "soon", mac_hex
+        ),
+        // Timestamp beyond what a DateTime can hold.
+        format!(
+            "Keystone {}:{}:{}:{}",
+            session.id,
+            nonce_hex,
+            i64::MAX,
+            mac_hex
+        ),
         // Missing fields.
         format!("Keystone {}", session.id),
     ];
@@ -930,8 +1072,7 @@ async fn manifest_expiry_is_capped_by_lease_and_grant() {
     assert_eq!(status, StatusCode::OK, "fetch failed: {body}");
     let env: Envelope = serde_json::from_value(body).unwrap();
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
     // The lease (300s) outlives the grant (120s) — grant wins.
     assert_eq!(signed.manifest.expires_at, grant_expiry);
     assert_eq!(env.expires_at, grant_expiry);
@@ -956,8 +1097,80 @@ async fn manifest_expiry_is_capped_by_lease_and_grant() {
     assert_eq!(status, StatusCode::OK, "fetch failed: {body}");
     let env: Envelope = serde_json::from_value(body).unwrap();
     let body_json: Value = serde_json::from_slice(&env.body).unwrap();
-    let signed: SignedManifest =
-        serde_json::from_value(body_json["manifest"].clone()).unwrap();
+    let signed: SignedManifest = serde_json::from_value(body_json["manifest"].clone()).unwrap();
     assert_eq!(signed.manifest.expires_at, lease_expiry);
     assert_eq!(env.expires_at, lease_expiry);
+}
+
+/// Both payload routes carry a per-session sliding-window limit, with
+/// separate buckets: throttling the manifest fetch leaves the blob
+/// download untouched and vice versa. 429 is transient — the session
+/// stays alive.
+#[tokio::test]
+async fn payload_routes_rate_limited_per_session() {
+    let dir = payload_dir_with(PRODUCT, VERSION, PAYLOAD_BYTES);
+    let mut state = test_state(Some(dir));
+    state.rate_limits.payload_fetch_per_session = 2;
+    state.rate_limits.payload_download_per_session = 1;
+    let app = build_router(state.clone());
+    let session = establish_session(&app).await;
+
+    for nonce in [[0x71u8; 32], [0x72u8; 32]] {
+        let (status, body) = post(
+            &app,
+            "/payload",
+            fetch_req(&session, PRODUCT, VERSION, nonce),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = post(
+        &app,
+        "/payload",
+        fetch_req(&session, PRODUCT, VERSION, [0x73u8; 32]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["code"], "rate_limited");
+
+    // The download bucket is its own: one succeeds, the next is 429.
+    let path = format!("/payload/{PRODUCT}/{VERSION}");
+    let auth = blob_auth(&session, PRODUCT, VERSION, [0x74u8; 32]);
+    let (status, _) = request(&app, "GET", &path, Some(auth), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let auth = blob_auth(&session, PRODUCT, VERSION, [0x75u8; 32]);
+    let (status, bytes) = request(&app, "GET", &path, Some(auth), None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["code"], "rate_limited");
+
+    assert!(matches!(
+        state.store.get(&session.id).unwrap().state,
+        SessionState::Active { .. }
+    ));
+}
+
+/// The artifact key derives from the server's epoch: a blob sealed
+/// under epoch 0 does not unseal on a server running epoch 1, so a
+/// rotation really does re-key the release — while the request MAC,
+/// which the client computes without knowing the epoch, still passes
+/// the gate.
+#[tokio::test]
+async fn payload_epoch_rekeys_artifacts() {
+    let dir = payload_dir_with(PRODUCT, VERSION, PAYLOAD_BYTES);
+    let mut state = test_state(Some(dir));
+    state.payload_epoch = 1;
+    let app = build_router(state);
+    let session = establish_session(&app).await;
+
+    let (status, body) = post(
+        &app,
+        "/payload",
+        fetch_req(&session, PRODUCT, VERSION, [0x42u8; 32]),
+    )
+    .await;
+    // Past the gate (not 401), but the epoch-0 blob is undecryptable
+    // under epoch 1 — a corrupt artifact, not a client problem.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "artifact_invalid");
 }

@@ -8,16 +8,16 @@
 //!   cargo xtask verify     (preflight checklist)
 //!   cargo xtask deploy     (release build + scp to the [target] host)
 
-use anyhow::{bail, Context, Result};
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+use anyhow::{Context, Result, bail};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
 use chrono::Utc;
 use keystone_core::{AccountFile, AccountGrant, AccountRecord, Issuer};
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command};
+use std::process::{Command, exit};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -98,8 +98,8 @@ fn workspace_root() -> PathBuf {
 
 fn load_config() -> Result<Config> {
     let path = workspace_root().join("xtask.toml");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     Ok(toml::from_str(&text)?)
 }
 
@@ -217,11 +217,12 @@ fn random_hex(bytes: usize) -> String {
 
 // ---- commands -----------------------------------------------------
 
-/// `keygen [--out <path>] [--force]` — mint the issuer seed and print the
-/// verifying key clients pin against. The seed itself is never printed:
-/// it belongs on disk with owner-only permissions, not in scrollback,
-/// shell history, or CI logs.
-fn cmd_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
+/// `keygen [--out <path>] [--key-id <n>] [--force]` — mint the issuer seed and print the
+/// `(key_id, pubkey)` pair clients bake into `TrustedIssuers`; the seed itself is never printed
+/// because scrollback, shell history, and CI logs are all leak paths, and `--key-id` (default 1,
+/// read back by the server as KEYSTONE_KEY_ID) is what lets clients hold several trusted keys and
+/// revoke one without dropping the rest.
+fn cmd_keygen(out: Option<PathBuf>, key_id: u8, force: bool) -> Result<()> {
     let path = match out {
         Some(p) => p,
         None => workspace_root().join(load_config()?.paths.keyfile),
@@ -231,14 +232,44 @@ fn cmd_keygen(out: Option<PathBuf>, force: bool) -> Result<()> {
     rand::thread_rng().fill_bytes(&mut seed);
     write_secret(&path, &seed, force)?;
 
-    let pubkey = hex::encode(Issuer::from_bytes(&seed).verifying_key().to_bytes());
+    let pubkey = hex::encode(Issuer::from_seed(&seed, key_id).verifying_key().to_bytes());
     println!("wrote 32-byte issuer seed to {}", path.display());
     println!();
-    println!("  verifying key (embed in clients as the pinned key):");
+    println!("  key id:        {key_id}");
+    println!("  verifying key (embed in clients as TrustedIssuers entry ({key_id}, pubkey)):");
     println!("    {pubkey}");
     println!();
-    println!("  the server reads the keyfile via KEYSTONE_KEYFILE={}", path.display());
+    println!(
+        "  the server reads the keyfile via KEYSTONE_KEYFILE={}",
+        path.display()
+    );
+    println!("  and the key id via KEYSTONE_KEY_ID={key_id}");
     Ok(())
+}
+
+/// Parse a `--key-id` value: a u8, default 1 when absent.
+fn parse_key_id(raw: Option<String>) -> Result<u8> {
+    match raw {
+        None => Ok(1),
+        Some(s) => s
+            .trim()
+            .parse::<u8>()
+            .with_context(|| format!("--key-id must be 0-255, got {s:?}")),
+    }
+}
+
+/// KEYSTONE_PAYLOAD_EPOCH for `seal` — same env the server reads. Every
+/// artifact key is derived over the epoch, so bumping it (after a
+/// secret rotation) makes every previously sealed blob unopenable until
+/// resealed. Default 0.
+fn load_payload_epoch() -> Result<u32> {
+    match std::env::var("KEYSTONE_PAYLOAD_EPOCH") {
+        Err(_) => Ok(0),
+        Ok(s) => s
+            .trim()
+            .parse::<u32>()
+            .with_context(|| format!("KEYSTONE_PAYLOAD_EPOCH must be a u32, got {s:?}")),
+    }
 }
 
 /// Load the keystone CA (cert params + key pair) from the configured
@@ -266,8 +297,8 @@ fn load_ca_paths(
         .with_context(|| format!("reading {}", cert_path.display()))?;
     let key_pem = std::fs::read_to_string(key_path)
         .with_context(|| format!("reading {}", key_path.display()))?;
-    let params = rcgen::CertificateParams::from_ca_cert_pem(&cert_pem)
-        .context("parsing CA certificate")?;
+    let params =
+        rcgen::CertificateParams::from_ca_cert_pem(&cert_pem).context("parsing CA certificate")?;
     let key_pair = rcgen::KeyPair::from_pem(&key_pem).context("parsing CA key")?;
     Ok(Some((params, key_pair)))
 }
@@ -314,7 +345,9 @@ fn cmd_ca(force: bool) -> Result<()> {
         rcgen::KeyUsagePurpose::DigitalSignature,
     ];
     let key_pair = rcgen::KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair).context("generating CA cert")?;
+    let cert = params
+        .self_signed(&key_pair)
+        .context("generating CA cert")?;
 
     write_public(&cert_path, cert.pem().as_bytes(), force)?;
     write_secret(&key_path, key_pair.serialize_pem().as_bytes(), force)?;
@@ -322,7 +355,10 @@ fn cmd_ca(force: bool) -> Result<()> {
     println!("wrote CA certificate to {}", cert_path.display());
     println!("wrote CA private key to {}", key_path.display());
     println!();
-    println!("  KEYSTONE_CA_CERT={}  (enables mTLS on the server)", cert_path.display());
+    println!(
+        "  KEYSTONE_CA_CERT={}  (enables mTLS on the server)",
+        cert_path.display()
+    );
     println!("  `cargo xtask cert` now signs the server cert with this CA;");
     println!("  `cargo xtask issue-cert <account>` mints client certs.");
     Ok(())
@@ -382,7 +418,14 @@ fn cmd_cert(extra_host: Option<String>, force: bool) -> Result<()> {
     println!("wrote certificate to {}", cert_path.display());
     println!("wrote private key to {}", key_path.display());
     println!("  SANs: {}", sans.join(", "));
-    println!("  signed by: {}", if ca_signed { "keystone CA" } else { "self (no CA found)" });
+    println!(
+        "  signed by: {}",
+        if ca_signed {
+            "keystone CA"
+        } else {
+            "self (no CA found)"
+        }
+    );
     println!("  server SPKI sha256 (client pin): {spki_sha256}");
     println!();
     println!("NOTE: keystone-server serves TLS when KEYSTONE_TLS_CERT and");
@@ -422,8 +465,6 @@ fn cmd_issue_cert(account: Option<String>, force: bool) -> Result<()> {
     Ok(())
 }
 
-
-
 /// `dev` — provision whatever's missing, print the env, run the server.
 fn cmd_dev() -> Result<()> {
     let cfg = load_config()?;
@@ -432,7 +473,7 @@ fn cmd_dev() -> Result<()> {
 
     if !keyfile.exists() {
         println!("no keyfile — generating one");
-        cmd_keygen(Some(keyfile.clone()), false)?;
+        cmd_keygen(Some(keyfile.clone()), 1, false)?;
     }
     if !root.join(&cfg.paths.cert).exists() || !root.join(&cfg.paths.cert_key).exists() {
         println!("no dev cert — generating one");
@@ -448,8 +489,14 @@ fn cmd_dev() -> Result<()> {
     println!("  KEYSTONE_DEV_SEED=1");
     println!("  KEYSTONE_ADMIN_TOKEN={admin_token}");
     println!("  KEYSTONE_PORT=8443 (default)");
-    println!("  KEYSTONE_TLS_CERT={}", root.join(&cfg.paths.cert).display());
-    println!("  KEYSTONE_TLS_KEY={}", root.join(&cfg.paths.cert_key).display());
+    println!(
+        "  KEYSTONE_TLS_CERT={}",
+        root.join(&cfg.paths.cert).display()
+    );
+    println!(
+        "  KEYSTONE_TLS_KEY={}",
+        root.join(&cfg.paths.cert_key).display()
+    );
     let ca_cert = root.join(&cfg.paths.ca_cert);
     let mtls = ca_cert.exists();
     if mtls {
@@ -460,8 +507,10 @@ fn cmd_dev() -> Result<()> {
     if accounts_file.exists() {
         println!("  KEYSTONE_ACCOUNTS={}", accounts_file.display());
         println!();
-        println!("accounts: file-backed ({}); dev seed is the fallback only",
-            accounts_file.display());
+        println!(
+            "accounts: file-backed ({}); dev seed is the fallback only",
+            accounts_file.display()
+        );
     } else {
         println!();
         println!("dev accounts: dev/devpass (product \"dev-product\"), nogrant");
@@ -484,7 +533,6 @@ fn cmd_dev() -> Result<()> {
     run(&mut cmd)
 }
 
-
 /// `deploy` — release build, then scp binary + keyfile to the target.
 fn cmd_deploy() -> Result<()> {
     let cfg = load_config()?;
@@ -501,10 +549,10 @@ fn cmd_deploy() -> Result<()> {
         .args(["build", "--release", "-p", "keystone-server"])
         .current_dir(&root))?;
 
-    let binary = root.join("target").join("release").join(format!(
-        "keystone-server{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let binary = root
+        .join("target")
+        .join("release")
+        .join(format!("keystone-server{}", std::env::consts::EXE_SUFFIX));
     if !binary.exists() {
         bail!("expected build artifact {}", binary.display());
     }
@@ -514,10 +562,10 @@ fn cmd_deploy() -> Result<()> {
     run(Command::new("ssh")
         .arg(&remote)
         .arg(format!("mkdir -p {}", cfg.deploy.remote_path)))?;
-    run(Command::new("scp").arg(&binary).arg(&keyfile).arg(format!(
-        "{remote}:{}/",
-        cfg.deploy.remote_path
-    )))?;
+    run(Command::new("scp")
+        .arg(&binary)
+        .arg(&keyfile)
+        .arg(format!("{remote}:{}/", cfg.deploy.remote_path)))?;
     println!(
         "deployed {} and {} to {remote}:{}/",
         binary.display(),
@@ -545,22 +593,38 @@ fn cmd_verify() -> Result<()> {
 
     println!("keystone preflight:");
 
-    // Issuer key material.
+    // Issuer key material. The key id is what the server will stamp
+    // into every signed envelope — surface it so the operator can
+    // confirm it matches what clients were built to trust.
+    let key_id = match std::env::var("KEYSTONE_KEY_ID") {
+        Err(_) => 1u8,
+        Ok(s) => match s.trim().parse::<u8>() {
+            Ok(n) => n,
+            Err(_) => {
+                check(None, "KEYSTONE_KEY_ID", &format!("{s:?} is not a u8"));
+                1
+            }
+        },
+    };
     let keyfile = root.join(&cfg.paths.keyfile);
     match std::fs::read(&keyfile) {
         Ok(bytes) if bytes.len() == 32 => {
             let seed: &[u8; 32] = bytes.as_slice().try_into().unwrap();
-            let pubkey = hex::encode(Issuer::from_bytes(seed).verifying_key().to_bytes());
+            let pubkey = hex::encode(Issuer::from_seed(seed, key_id).verifying_key().to_bytes());
             check(
                 Some(true),
                 "keyfile",
-                &format!("{} (pubkey {pubkey})", keyfile.display()),
+                &format!("{} (key id {key_id}, pubkey {pubkey})", keyfile.display()),
             );
         }
         Ok(bytes) => check(
             None,
             "keyfile",
-            &format!("{} is {} bytes, expected 32", keyfile.display(), bytes.len()),
+            &format!(
+                "{} is {} bytes, expected 32",
+                keyfile.display(),
+                bytes.len()
+            ),
         ),
         Err(_) => check(
             None,
@@ -569,9 +633,36 @@ fn cmd_verify() -> Result<()> {
         ),
     }
 
+    // Production posture: the server refuses plain HTTP and TLS-without-
+    // mTLS unless KEYSTONE_ALLOW_INSECURE=1. That flag is for local dev
+    // only — its presence in a deploy environment is a misconfiguration.
+    match std::env::var("KEYSTONE_ALLOW_INSECURE") {
+        Ok(v) if v.trim() == "1" => check(
+            Some(false),
+            "KEYSTONE_ALLOW_INSECURE",
+            "set — server will accept plain HTTP / no-mTLS; unset before deploying",
+        ),
+        _ => check(
+            Some(true),
+            "KEYSTONE_ALLOW_INSECURE",
+            "unset (mTLS required)",
+        ),
+    }
+
+    // Payload epoch: must parse, and the operator should know which
+    // epoch the sealed artifacts on disk were produced under.
+    match load_payload_epoch() {
+        Ok(e) => check(Some(true), "KEYSTONE_PAYLOAD_EPOCH", &format!("{e}")),
+        Err(e) => check(None, "KEYSTONE_PAYLOAD_EPOCH", &e.to_string()),
+    }
+
     // Dev TLS material.
     for (label, path, marker) in [
-        ("cert", cfg.paths.cert.as_str(), "-----BEGIN CERTIFICATE-----"),
+        (
+            "cert",
+            cfg.paths.cert.as_str(),
+            "-----BEGIN CERTIFICATE-----",
+        ),
         ("cert key", cfg.paths.cert_key.as_str(), "-----BEGIN"),
     ] {
         let full = root.join(path);
@@ -589,7 +680,10 @@ fn cmd_verify() -> Result<()> {
     }
 
     // Environment the server reads.
-    match (std::env::var("KEYSTONE_KEYFILE"), std::env::var("KEYSTONE_SEED")) {
+    match (
+        std::env::var("KEYSTONE_KEYFILE"),
+        std::env::var("KEYSTONE_SEED"),
+    ) {
         (Ok(p), _) => check(Some(true), "KEYSTONE_KEYFILE", &p),
         (Err(_), Ok(_)) => check(Some(true), "KEYSTONE_SEED", "set (hex seed)"),
         (Err(_), Err(_)) => check(
@@ -626,8 +720,7 @@ fn cmd_verify() -> Result<()> {
         } else if dev_seed {
             "KEYSTONE_DEV_SEED=1 — stub dev accounts".to_string()
         } else {
-            "no accounts file and KEYSTONE_DEV_SEED unset — server will refuse to start"
-                .to_string()
+            "no accounts file and KEYSTONE_DEV_SEED unset — server will refuse to start".to_string()
         },
     );
 
@@ -643,9 +736,12 @@ fn cmd_verify() -> Result<()> {
 /// `{product}-{version}.bin`.
 ///
 /// The artifact secret comes from KEYSTONE_PAYLOAD_SECRET (hex) or
-/// KEYSTONE_PAYLOAD_SECRET_FILE (raw 32 bytes) — the same env the
-/// server reads, so a sealed artifact is always one the server can
-/// attest. The plaintext never lands in the payload dir.
+/// KEYSTONE_PAYLOAD_SECRET_FILE (raw 32 bytes), and the epoch from
+/// KEYSTONE_PAYLOAD_EPOCH (default 0) — the same env the server reads,
+/// so a sealed artifact is always one the server can attest. Rotating
+/// the secret means bumping the epoch and resealing every artifact; a
+/// blob sealed under the old epoch is simply unopenable afterwards.
+/// The plaintext never lands in the payload dir.
 ///
 /// The build id is the per-release watermark: it lands in a
 /// `{product}-{version}.build` sidecar the server stamps into every
@@ -665,6 +761,7 @@ fn cmd_seal(
         _ => bail!("seal requires --product, --version, --in, and --out"),
     };
     let secret = load_payload_secret()?;
+    let epoch = load_payload_epoch()?;
     let plaintext = std::fs::read(&input).with_context(|| format!("reading {input}"))?;
     anyhow::ensure!(
         plaintext.len() as u64 <= keystone_core::MAX_ARTIFACT_BYTES,
@@ -674,9 +771,9 @@ fn cmd_seal(
     // The context must be the length-prefixed form the server derives
     // keys with — "{product}:{version}" is ambiguous AND wrong here:
     // a blob sealed under it can never be opened by artifact_key_for.
-    let context = keystone_core::artifact_context(&product, &version);
-    let sealed = keystone_core::seal_artifact(&secret, &context, &plaintext)
-        .context("sealing artifact")?;
+    let context = keystone_core::artifact_context(&product, &version, epoch);
+    let sealed =
+        keystone_core::seal_artifact(&secret, &context, &plaintext).context("sealing artifact")?;
     let dir = PathBuf::from(&out_dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {out_dir}"))?;
     let dest = dir.join(format!("{product}-{version}.bin"));
@@ -686,7 +783,8 @@ fn cmd_seal(
             anyhow::ensure!(
                 !id.is_empty()
                     && id.len() <= 64
-                    && id.bytes()
+                    && id
+                        .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
                 "--build-id must be 1-64 chars of [A-Za-z0-9._-]"
             );
@@ -705,12 +803,13 @@ fn cmd_seal(
     std::fs::write(&sha_sidecar, hex::encode(Sha256::digest(&plaintext)))
         .with_context(|| format!("writing {}", sha_sidecar.display()))?;
     println!(
-        "sealed {} ({} bytes) -> {} ({} bytes), build {}",
+        "sealed {} ({} bytes) -> {} ({} bytes), build {}, epoch {}",
         input,
         plaintext.len(),
         dest.display(),
         sealed.len(),
-        build_id
+        build_id,
+        epoch
     );
     Ok(())
 }
@@ -747,7 +846,8 @@ fn load_payload_secret() -> Result<[u8; 32]> {
             .context("KEYSTONE_PAYLOAD_SECRET_FILE must contain exactly 32 bytes");
     }
     if let Ok(hex_secret) = std::env::var("KEYSTONE_PAYLOAD_SECRET") {
-        let bytes = hex::decode(hex_secret.trim()).context("KEYSTONE_PAYLOAD_SECRET must be hex")?;
+        let bytes =
+            hex::decode(hex_secret.trim()).context("KEYSTONE_PAYLOAD_SECRET must be hex")?;
         return bytes
             .as_slice()
             .try_into()
@@ -826,8 +926,7 @@ fn account_add(args: &[String]) -> Result<()> {
         entitlements: vec![],
         cert_sha256: None,
     });
-    file.save(&path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    file.save(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("added account {name} to {}", path.display());
     Ok(())
 }
@@ -847,8 +946,8 @@ fn prompt_secret(name: &str) -> Result<String> {
     }
     let first = rpassword::prompt_password(format!("secret for {name}: "))
         .context("reading account secret")?;
-    let second = rpassword::prompt_password("confirm secret: ")
-        .context("reading account secret")?;
+    let second =
+        rpassword::prompt_password("confirm secret: ").context("reading account secret")?;
     anyhow::ensure!(first == second, "secrets did not match");
     Ok(first)
 }
@@ -858,8 +957,7 @@ fn prompt_secret(name: &str) -> Result<String> {
 /// grant — that's how an operator extends a subscription.
 fn account_grant(args: &[String]) -> Result<()> {
     let name = account_name(args, "grant")?;
-    let product =
-        take_value(args, "--product")?.context("account grant requires --product <p>")?;
+    let product = take_value(args, "--product")?.context("account grant requires --product <p>")?;
     let days: i64 = take_value(args, "--days")?
         .context("account grant requires --days <n>")?
         .parse()
@@ -868,7 +966,12 @@ fn account_grant(args: &[String]) -> Result<()> {
     // a grant while authorizing nothing. Reject it as an operator error.
     anyhow::ensure!(days > 0, "--days must be positive, got {days}");
     let features = take_value(args, "--features")?
-        .map(|f| f.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .map(|f| {
+            f.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     let path = accounts_path(args)?;
     let mut file = load_accounts(&path)?;
@@ -884,8 +987,7 @@ fn account_grant(args: &[String]) -> Result<()> {
         expires_at,
         features,
     });
-    file.save(&path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    file.save(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("granted {name} {product} until {}", expires_at.to_rfc3339());
     Ok(())
 }
@@ -910,8 +1012,7 @@ fn account_revoke(args: &[String]) -> Result<()> {
         record.entitlements.len() < before,
         "account {name} holds no grant for {product}"
     );
-    file.save(&path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    file.save(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("revoked {name}'s grant for {product}");
     Ok(())
 }
@@ -993,8 +1094,7 @@ fn account_cert(args: &[String], force: bool) -> Result<()> {
         .find(|a| a.name == name)
         .expect("checked above");
     record.cert_sha256 = Some(cert_sha256.clone());
-    file.save(&path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    file.save(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("wrote client certificate to {}", cert_path.display());
     println!("wrote client private key to {}", key_path.display());
@@ -1027,7 +1127,8 @@ fn usage() -> ! {
     eprintln!(
         "cargo xtask <command>
 
-  keygen [--out <path>] [--force]   generate issuer seed, print pinned pubkey
+  keygen [--out <path>] [--key-id <n>] [--force]
+                                    generate issuer seed, print (key_id, pubkey) to pin
   ca [--force]                      generate the keystone CA (signs server + client certs)
   cert [--host <name>] [--force]    server TLS cert (CA-signed when a CA exists)
   issue-cert <account> [--force]    sign a client cert (CN=<account>) with the CA
@@ -1065,13 +1166,14 @@ fn main() -> Result<()> {
     let force = rest.iter().any(|a| a == "--force");
 
     match cmd.as_str() {
-        "keygen" => cmd_keygen(take_value(rest, "--out")?.map(PathBuf::from), force),
-        "ca" => cmd_ca(force),
-        "cert" => cmd_cert(take_value(rest, "--host")?, force),
-        "issue-cert" => cmd_issue_cert(
-            rest.iter().find(|a| !a.starts_with("--")).cloned(),
+        "keygen" => cmd_keygen(
+            take_value(rest, "--out")?.map(PathBuf::from),
+            parse_key_id(take_value(rest, "--key-id")?)?,
             force,
         ),
+        "ca" => cmd_ca(force),
+        "cert" => cmd_cert(take_value(rest, "--host")?, force),
+        "issue-cert" => cmd_issue_cert(rest.iter().find(|a| !a.starts_with("--")).cloned(), force),
         "payload-secret" => {
             cmd_payload_secret(take_value(rest, "--out")?.map(PathBuf::from), force)
         }

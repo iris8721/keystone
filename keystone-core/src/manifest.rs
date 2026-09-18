@@ -7,13 +7,13 @@
 //! payload key it accompanies is derived from the session key.
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::crypto::{self, DOMAIN_MANIFEST};
 use crate::error::{KeystoneError, Result};
+use crate::issuers::TrustedIssuers;
 
 /// What the server attests about one release artifact: which bytes are
 /// the real payload and which features those bytes may enable.
@@ -21,7 +21,7 @@ use crate::error::{KeystoneError, Result};
 pub struct Manifest {
     pub product: String,
     pub version: String,
-    /// Per-release identifier stamped at seal time (DESIGN.md:
+    /// Per-release identifier stamped at seal time (README:
     /// deterrence layer — a leaked build's manifest ties it to the
     /// release that produced it). Signed like every other field so
     /// attribution can't be rewritten. `default` keeps manifests
@@ -40,7 +40,7 @@ pub struct Manifest {
     /// executed — a tampered download fails here, not at runtime.
     #[serde(with = "serde_big_array::BigArray")]
     pub sha256: [u8; 32],
-    /// Server-issued per-feature grants (DESIGN.md: no local feature
+    /// Server-issued per-feature grants (README: no local feature
     /// gating). The payload consults these at runtime; an expired grant
     /// means the feature is off even though the bytes are present.
     pub feature_grants: Vec<FeatureGrant>,
@@ -59,20 +59,22 @@ pub struct FeatureGrant {
 /// A manifest plus the issuer's signature over its canonical bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedManifest {
+    /// Which issuer key signed this — selects the verifying key from
+    /// the verifier's `TrustedIssuers`. Signed alongside the manifest
+    /// so it can't be re-pointed at another key.
+    pub key_id: u8,
     pub manifest: Manifest,
-    /// Ed25519 signature over `manifest.canonical_bytes()`.
+    /// Ed25519 signature over `SignedManifest::canonical_bytes`.
     #[serde(with = "serde_big_array::BigArray")]
     pub signature: [u8; 64],
 }
 
 impl Manifest {
-    /// Canonical signed bytes — same construction as
-    /// `Envelope::canonical_bytes`: domain separator, then explicit
-    /// length-prefixed fields so the wire format and the signed format
-    /// can never disagree.
+    /// The attested fields, length-prefixed like `Envelope`'s. Not the
+    /// signed bytes on its own — `SignedManifest::canonical_bytes`
+    /// prepends the domain separator and the signing key id.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(DOMAIN_MANIFEST);
         push_str(&mut buf, &self.product);
         push_str(&mut buf, &self.version);
         push_str(&mut buf, &self.build_id);
@@ -127,21 +129,38 @@ impl SignedManifest {
     /// forged timestamp or a broken clock.
     const MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::seconds(30);
 
-    /// Server-side: sign a manifest. The signature covers every field
-    /// through `canonical_bytes`, so nothing attested can drift from
-    /// what was signed.
-    pub fn issue(issuer: &crypto::Issuer, manifest: Manifest) -> Self {
-        let signature = issuer.sign(&manifest.canonical_bytes());
-        Self {
-            manifest,
-            signature,
-        }
+    /// Canonical signed bytes: domain separator, then the signing key
+    /// id, then the manifest's attested fields — same construction as
+    /// `Envelope::canonical_bytes`, so the wire format and the signed
+    /// format can never disagree.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let fields = self.manifest.canonical_bytes();
+        let mut buf = Vec::with_capacity(DOMAIN_MANIFEST.len() + 1 + fields.len());
+        buf.extend_from_slice(DOMAIN_MANIFEST);
+        buf.push(self.key_id);
+        buf.extend_from_slice(&fields);
+        buf
     }
 
-    /// Client-side: verify the signature, then freshness and expiry.
-    /// Returns the attested manifest only when every check passes.
-    pub fn verify(&self, key: &VerifyingKey, now: DateTime<Utc>) -> Result<&Manifest> {
-        crypto::verify(key, &self.manifest.canonical_bytes(), &self.signature)?;
+    /// Server-side: sign a manifest under the issuer's key id. The
+    /// signature covers every field through `canonical_bytes`, so
+    /// nothing attested can drift from what was signed.
+    pub fn issue(issuer: &crypto::Issuer, manifest: Manifest) -> Self {
+        let mut signed = Self {
+            key_id: issuer.key_id(),
+            manifest,
+            signature: [0u8; 64],
+        };
+        signed.signature = issuer.sign(&signed.canonical_bytes());
+        signed
+    }
+
+    /// Client-side: resolve the signing key by id, verify the
+    /// signature, then freshness and expiry. Returns the attested
+    /// manifest only when every check passes.
+    pub fn verify(&self, issuers: &TrustedIssuers, now: DateTime<Utc>) -> Result<&Manifest> {
+        let key = issuers.key_for(self.key_id)?;
+        crypto::verify(key, &self.canonical_bytes(), &self.signature)?;
         if self.manifest.issued_at > now + Self::MAX_FUTURE_SKEW {
             return Err(KeystoneError::ClockSkew);
         }

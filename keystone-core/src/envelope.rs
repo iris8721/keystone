@@ -1,13 +1,13 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::crypto::{self, DOMAIN_ENVELOPE};
 use crate::error::{KeystoneError, Result};
+use crate::issuers::TrustedIssuers;
 
 /// A signed authorization response. Per the spec, every response must be
 /// signed, fresh (challenge-bound), scoped (session + audience +
@@ -15,6 +15,10 @@ use crate::error::{KeystoneError, Result};
 /// replay cache, not this type).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Envelope {
+    /// Which issuer key signed this. Selects the verifying key from the
+    /// verifier's `TrustedIssuers`; signed, so a response can't be
+    /// re-pointed at a different key than the one that minted it.
+    pub key_id: u8,
     /// Echoes the challenge the verifier issued. Replay of an old
     /// response fails here even with a valid signature.
     #[serde(with = "serde_big_array::BigArray")]
@@ -71,6 +75,7 @@ impl Envelope {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(DOMAIN_ENVELOPE);
+        buf.push(self.key_id);
         buf.extend_from_slice(&self.challenge);
         buf.extend_from_slice(self.session_id.as_bytes());
         push_str(&mut buf, &self.audience);
@@ -82,9 +87,10 @@ impl Envelope {
         buf
     }
 
-    /// Server-side: build and sign an envelope.
+    /// Server-side: build and sign an envelope under the issuer's key id.
     pub fn issue(issuer: &crypto::Issuer, spec: IssueSpec) -> Self {
         let mut env = Self {
+            key_id: issuer.key_id(),
             challenge: spec.challenge,
             session_id: spec.session_id,
             audience: spec.audience,
@@ -98,14 +104,12 @@ impl Envelope {
         env
     }
 
-    /// Client-side: verify signature, then every binding. Order matters
-    /// for the error taxonomy — signature first (forgery), then
-    /// freshness, then scope, then expiry.
-    pub fn verify(
-        &self,
-        key: &VerifyingKey,
-        expect: &Expectation<'_>,
-    ) -> Result<()> {
+    /// Client-side: resolve the signing key by id, verify the signature,
+    /// then every binding. Order matters for the error taxonomy — key
+    /// trust first (unknown or revoked issuer), then signature
+    /// (forgery), then freshness, then scope, then expiry.
+    pub fn verify(&self, issuers: &TrustedIssuers, expect: &Expectation<'_>) -> Result<()> {
+        let key = issuers.key_for(self.key_id)?;
         crypto::verify(key, &self.canonical_bytes(), &self.signature)?;
 
         // Constant-time: the challenge is a secret-bound nonce, and a
@@ -113,9 +117,7 @@ impl Envelope {
         if !bool::from(self.challenge[..].ct_eq(&expect.challenge[..])) {
             return Err(KeystoneError::ChallengeMismatch);
         }
-        if !bool::from(
-            self.session_id.as_bytes()[..].ct_eq(&expect.session_id.as_bytes()[..]),
-        ) {
+        if !bool::from(self.session_id.as_bytes()[..].ct_eq(&expect.session_id.as_bytes()[..])) {
             return Err(KeystoneError::SessionMismatch);
         }
         if self.audience != expect.audience {
@@ -145,6 +147,7 @@ impl Envelope {
 impl fmt::Debug for Envelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Envelope")
+            .field("key_id", &self.key_id)
             .field("challenge", &self.challenge)
             .field("session_id", &self.session_id)
             .field("audience", &self.audience)

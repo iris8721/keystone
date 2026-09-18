@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn workdir() -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("keystone-xtask-keygen-{}", rand::random::<u64>()));
+    let dir = std::env::temp_dir().join(format!("keystone-xtask-keygen-{}", rand::random::<u64>()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -99,4 +98,51 @@ fn keygen_refuses_to_clobber_without_force() {
         .unwrap();
     assert!(out.status.success(), "forced keygen failed: {out:?}");
     assert_ne!(std::fs::read(&keyfile).unwrap(), original);
+}
+
+/// The key id is what clients pair with the pubkey in `TrustedIssuers`
+/// and what the server stamps into every envelope — keygen must print
+/// it, default it to 1, and refuse anything outside u8.
+#[test]
+fn keygen_prints_key_id_and_defaults_to_one() {
+    let dir = workdir();
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .arg("keygen")
+        .arg("--out")
+        .arg(dir.join("default.key"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "keygen failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("key id:        1"),
+        "default key id must be 1: {stdout}"
+    );
+    assert!(stdout.contains("KEYSTONE_KEY_ID=1"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .arg("keygen")
+        .arg("--out")
+        .arg(dir.join("two.key"))
+        .args(["--key-id", "2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "keygen --key-id 2 failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("key id:        2"), "{stdout}");
+    assert!(stdout.contains("KEYSTONE_KEY_ID=2"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .arg("keygen")
+        .arg("--out")
+        .arg(dir.join("bad.key"))
+        .args(["--key-id", "256"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "256 is not a u8");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--key-id"));
+    assert!(
+        !dir.join("bad.key").exists(),
+        "no keyfile on a rejected key id"
+    );
 }

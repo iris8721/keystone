@@ -9,15 +9,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
 use argon2::Argon2;
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use keystone_core::{
-    AccountIdentity, Entitlement, EntitlementSource, KeystoneError,
-};
+use keystone_core::{AccountIdentity, Entitlement, EntitlementSource, KeystoneError};
 
 /// In-memory account table: account → (argon2 secret hash, product grants).
 ///
@@ -104,10 +102,16 @@ impl EntitlementSource for StubEntitlementSource {
         account: &str,
         product: &str,
     ) -> Result<Option<Entitlement>, KeystoneError> {
-        Ok(self
-            .accounts
-            .get(account)
-            .and_then(|e| e.entitlements.iter().find(|g| g.product == product).cloned()))
+        // An expired grant reads as no grant — the same contract
+        // `LocalAccounts` honours, so the routes see one backend
+        // behaviour whichever source is wired in.
+        let now = Utc::now();
+        Ok(self.accounts.get(account).and_then(|e| {
+            e.entitlements
+                .iter()
+                .find(|g| g.product == product && now < g.expires_at)
+                .cloned()
+        }))
     }
 }
 

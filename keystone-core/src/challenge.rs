@@ -26,11 +26,7 @@ impl Challenge {
 
     /// Deterministic constructor for tests and for reconstructing a
     /// challenge received over the wire.
-    pub fn from_parts(
-        nonce: [u8; 32],
-        issued_at: DateTime<Utc>,
-        ttl: Duration,
-    ) -> Self {
+    pub fn from_parts(nonce: [u8; 32], issued_at: DateTime<Utc>, ttl: Duration) -> Self {
         Self {
             nonce,
             issued_at,
@@ -41,5 +37,4 @@ impl Challenge {
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         now >= self.issued_at + self.ttl
     }
-
 }

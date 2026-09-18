@@ -1,17 +1,18 @@
 //! Client-side session: the material and state an exchange produces.
 //!
 //! The session key is the only thing that proves possession to the
-//! server — it is never serialized, never logged, and dropped the
-//! moment the session dies so a dead session cannot mint MACs.
+//! server — it is never serialized, never logged, held in zeroizing
+//! memory, and dropped the moment the session dies so a dead session
+//! cannot mint MACs.
 
 use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use keystone_core::{
-    ConsumedSet, DeadReason, Handoff, HandoffPayload, KeystoneError, Lease, Manifest,
-    SessionState,
+    ConsumedSet, DeadReason, Handoff, HandoffPayload, KeystoneError, Lease, Manifest, SessionState,
 };
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 
@@ -23,12 +24,10 @@ use crate::error::ClientError;
 pub struct ClientSession {
     session_id: Uuid,
     /// `None` once the session is dead: kill drops the key so no
-    /// further attest/heartbeat MAC can ever be produced from it.
-    session_key: Option<[u8; 32]>,
-    /// The issuer verifying key the exchange was verified against.
-    /// Sealed into handoffs so the app pins the same key without
-    /// trusting an unauthenticated channel for it.
-    server_pubkey: [u8; 32],
+    /// further attest/heartbeat MAC can ever be produced from it. The
+    /// wrapper zeroizes the bytes on drop, so a dead session leaves no
+    /// key material behind in memory either.
+    session_key: Option<Zeroizing<[u8; 32]>>,
     state: SessionState,
     /// Response nonces this session already accepted. A replayed
     /// envelope carries a nonce we've seen — rejected even if it still
@@ -40,7 +39,7 @@ pub struct ClientSession {
     /// local clock must not misjudge an envelope or a deadline.
     clock_drift: chrono::Duration,
     /// Sessions opened from a handoff have not yet performed the
-    /// application's own attestation (DESIGN.md step 6). Until
+    /// application's own attestation (README step 6). Until
     /// `attest` succeeds, no session-bound operation may run — the
     /// app cannot skip proving itself to the server.
     pending_attest: bool,
@@ -49,16 +48,10 @@ pub struct ClientSession {
 impl ClientSession {
     /// Build a session from a verified exchange. `lease` becomes the
     /// initial Active state.
-    pub(crate) fn new(
-        session_id: Uuid,
-        session_key: [u8; 32],
-        lease: Lease,
-        server_pubkey: [u8; 32],
-    ) -> Self {
+    pub(crate) fn new(session_id: Uuid, session_key: [u8; 32], lease: Lease) -> Self {
         Self {
             session_id,
-            session_key: Some(session_key),
-            server_pubkey,
+            session_key: Some(Zeroizing::new(session_key)),
             state: SessionState::Active { lease },
             consumed: ConsumedSet::new(),
             clock_drift: chrono::Duration::zero(),
@@ -104,13 +97,15 @@ impl ClientSession {
     /// The session key, or `MissingSessionKey` once the session is
     /// dead and the material dropped.
     pub(crate) fn session_key(&self) -> Result<&[u8; 32], ClientError> {
-        self.session_key.as_ref().ok_or(ClientError::MissingSessionKey)
+        self.session_key
+            .as_deref()
+            .ok_or(ClientError::MissingSessionKey)
     }
 
     /// May protected operations run right now? Judges on
     /// drift-adjusted time and owns the consequences: an Expired or
     /// GraceExhausted verdict kills the session and drops the key —
-    /// "grace exhausted → clear session material" (DESIGN.md step 9).
+    /// "grace exhausted → clear session material" (README step 9).
     /// A handoff session that hasn't attested yet is NotAuthenticated
     /// regardless of what its lease says.
     pub fn authorize(&mut self) -> Result<(), ClientError> {
@@ -151,8 +146,7 @@ impl ClientSession {
             SessionState::Dead { .. } => return None,
         };
         let window = lease.expires_at - lease.granted_at;
-        let mut due =
-            lease.granted_at + Duration::milliseconds(window.num_milliseconds() * 4 / 5);
+        let mut due = lease.granted_at + Duration::milliseconds(window.num_milliseconds() * 4 / 5);
         if let Some(deadline) = deadline {
             due = due.min(deadline);
         }
@@ -184,23 +178,20 @@ impl ClientSession {
         manifest.has_feature(name, now)
     }
 
-    /// The issuer verifying key this session was established under —
-    /// the key the app must pin when it builds its own client.
-    pub fn server_pubkey(&self) -> [u8; 32] {
-        self.server_pubkey
-    }
-
     /// Produce the encrypted handoff for the application this client
-    /// is about to launch (DESIGN.md step 5).
+    /// is about to launch (README step 5).
     ///
     /// Returns the sealed blob plus the freshly generated handoff key.
     /// The blob carries only what the app needs to attest — session
-    /// id, session key, lease, pinned issuer key — and the caller
-    /// delivers the key to the child through the launch channel (env
-    /// var, argv, shared memory). Without it the blob is AEAD-sealed
-    /// noise; with it, only the intended `process_id` can open it —
-    /// a name-level binding to a claimed identity, not OS-verified
-    /// process identity.
+    /// id, session key, lease — and the caller delivers the key to the
+    /// child through the launch channel (env var, argv, shared
+    /// memory). Without it the blob is AEAD-sealed noise; with it, only
+    /// the intended `process_id` can open it — a name-level binding to
+    /// a claimed identity, not OS-verified process identity.
+    ///
+    /// The blob never carries an issuer key: the app bakes its own
+    /// `TrustedIssuers` at build time, and the loader is never a
+    /// source of trust.
     ///
     /// A dead session cannot mint a handoff — its key is already gone.
     /// `ttl` is clamped to `MAX_HANDOFF_TTL`: a handoff is a
@@ -233,7 +224,7 @@ impl ClientSession {
                 session_id: self.session_id,
                 session_key: *session_key,
                 lease,
-                server_pubkey: self.server_pubkey,
+                clock_drift_millis: self.clock_drift.num_milliseconds(),
             },
             process_id,
             ttl,
@@ -246,7 +237,10 @@ impl ClientSession {
     ///
     /// This is how the payload obtains session material without ever
     /// seeing credentials — it still must prove session-key possession
-    /// to the server itself via `KeystoneClient::attest`.
+    /// to the server itself via `KeystoneClient::attest`. The app
+    /// inherits the loader's observed clock drift, so that first
+    /// attest is stamped with an `issued_at` already inside the
+    /// server's skew window even on a badly skewed local clock.
     pub fn from_handoff(
         handoff_key: &[u8; 32],
         blob: &Handoff,
@@ -254,15 +248,17 @@ impl ClientSession {
         now: DateTime<Utc>,
     ) -> Result<Self, ClientError> {
         let payload = blob.open(handoff_key, process_id, now)?;
+        // `HandoffPayload` zeroizes on drop, so its fields cannot be
+        // moved out — copy the key into its own zeroizing slot and
+        // clone the lease.
         Ok(Self {
             session_id: payload.session_id,
-            session_key: Some(payload.session_key),
-            server_pubkey: payload.server_pubkey,
+            session_key: Some(Zeroizing::new(payload.session_key)),
             state: SessionState::Active {
-                lease: payload.lease,
+                lease: payload.lease.clone(),
             },
             consumed: ConsumedSet::new(),
-            clock_drift: chrono::Duration::zero(),
+            clock_drift: chrono::Duration::milliseconds(payload.clock_drift_millis),
             // The app still owes the server its own attestation —
             // opening the blob proves launch-channel possession, not
             // session-key possession to the server.
@@ -284,8 +280,11 @@ impl ClientSession {
     }
 
     /// Successful heartbeat: install the refreshed lease, clear grace.
+    /// Uses drift-adjusted time so a late response cannot resurrect a
+    /// session whose grace deadline already passed.
     pub(crate) fn on_heartbeat_ok(&mut self, lease: Lease) {
-        self.state.on_heartbeat_ok(lease);
+        let now = self.now();
+        self.state.on_heartbeat_ok(lease, now);
     }
 
     /// Transient failure: first one fixes the grace deadline, later
@@ -295,7 +294,8 @@ impl ClientSession {
     }
 
     /// Terminal rejection. Drops the session key first — a dead
-    /// session must not retain the material that could mint MACs.
+    /// session must not retain the material that could mint MACs, and
+    /// the `Zeroizing` wrapper scrubs the bytes as it goes.
     pub(crate) fn kill(&mut self, reason: DeadReason) {
         self.session_key = None;
         self.state.kill(reason);
@@ -329,7 +329,6 @@ mod tests {
                 expires_at: Utc::now() + Duration::seconds(300),
                 grace_period: Duration::seconds(60),
             },
-            [0x77; 32],
         )
     }
 
@@ -416,5 +415,26 @@ mod tests {
         ));
         app.clear_pending_attest();
         assert!(app.authorize().is_ok());
+    }
+
+    #[test]
+    fn handoff_carries_and_applies_clock_drift() {
+        let mut s = session();
+        // The loader learned the server runs +90s; the app must open
+        // with the same offset so its first attest is stamped inside
+        // the server's window instead of on the raw local clock.
+        s.observe_server_time(Utc::now() + Duration::seconds(90));
+        let (blob, key) = s.make_handoff("app", Duration::seconds(60)).unwrap();
+        let app = ClientSession::from_handoff(&key, &blob, "app", Utc::now()).unwrap();
+
+        assert_eq!(
+            app.clock_drift().num_milliseconds(),
+            s.clock_drift().num_milliseconds()
+        );
+        let ahead = app.now() - Utc::now();
+        assert!(
+            (ahead - Duration::seconds(90)).num_milliseconds().abs() < 1000,
+            "handoff session must run ~90s ahead of local, got {ahead}"
+        );
     }
 }

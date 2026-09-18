@@ -9,6 +9,9 @@ pub enum KeystoneError {
     #[error("signature verification failed")]
     InvalidSignature,
 
+    #[error("untrusted issuer key {key_id}")]
+    UntrustedIssuer { key_id: u8 },
+
     #[error("response MAC does not match")]
     InvalidMac,
 
@@ -45,6 +48,5 @@ pub enum KeystoneError {
     #[error("clock skew beyond tolerance")]
     ClockSkew,
 }
-
 
 pub type Result<T, E = KeystoneError> = std::result::Result<T, E>;

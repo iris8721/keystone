@@ -27,11 +27,7 @@ impl ConsumedSet {
     /// was accepted before; otherwise records it with the response's
     /// expiry. Atomicity matters — checking then inserting separately
     /// would open a concurrent-replay race.
-    pub fn consume(
-        &mut self,
-        nonce: [u8; 32],
-        expires_at: DateTime<Utc>,
-    ) -> Result<()> {
+    pub fn consume(&mut self, nonce: [u8; 32], expires_at: DateTime<Utc>) -> Result<()> {
         if self.consumed.contains_key(&nonce) {
             return Err(KeystoneError::AlreadyConsumed);
         }

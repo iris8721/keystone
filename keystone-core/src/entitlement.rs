@@ -31,9 +31,9 @@ pub struct AccountIdentity {
     pub account: String,
 }
 
-/// Where entitlement records come from. The production source is forum
-/// group sync (xenforo, per DESIGN.md); the server ships a stub for
-/// development.
+/// Where entitlement records come from. The production source is the
+/// local accounts file (`keystone-server::accounts::LocalAccounts`); the
+/// server ships a stub for development.
 ///
 /// `Ok(None)` from either method means "no such record" — bad
 /// credentials or no grant. `Err` is reserved for backend failures,

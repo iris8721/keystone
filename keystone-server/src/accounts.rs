@@ -14,13 +14,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+};
 use async_trait::async_trait;
 use chrono::Utc;
-use keystone_core::{
-    AccountFile, AccountIdentity, Entitlement, EntitlementSource, KeystoneError,
-};
+use keystone_core::{AccountFile, AccountIdentity, Entitlement, EntitlementSource, KeystoneError};
 
 /// Local account backend: reads `KEYSTONE_ACCOUNTS`, reloads on mtime
 /// change.
@@ -145,10 +145,7 @@ impl EntitlementSource for LocalAccounts {
     /// `Some` means /exchange must see exactly this cert (CN = account
     /// name) at the TLS layer; `None` means any CA-issued cert
     /// authenticates the install.
-    async fn cert_sha256(
-        &self,
-        account: &str,
-    ) -> Result<Option<[u8; 32]>, KeystoneError> {
+    async fn cert_sha256(&self, account: &str) -> Result<Option<[u8; 32]>, KeystoneError> {
         let file = self.current()?;
         let Some(hex_hash) = file
             .accounts

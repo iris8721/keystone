@@ -8,24 +8,24 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::{
+    Extension, Router,
     extract::{ConnectInfo, Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{Json, Response},
     routing::{get, post},
-    Extension, Router,
 };
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use keystone_core::{
-    artifact_context, artifact_key_for, decrypt_artifact, payload_wrap_key,
-    verify_heartbeat_mac, verify_response_mac, wrap_artifact_key, Challenge, ConsumedSet,
-    DeadReason, Entitlement, Envelope, FeatureGrant, IssueSpec, KeystoneError, KeyWrap, Lease,
-    Manifest, SessionState, SignedManifest, MAX_ARTIFACT_BYTES,
+    ConsumedSet, DeadReason, Entitlement, Envelope, FeatureGrant, IssueSpec, KeyWrap,
+    KeystoneError, Lease, MAX_ARTIFACT_BYTES, Manifest, RequestBinding, SessionState,
+    SignedManifest, artifact_context, artifact_key_for, check_request_freshness, decrypt_artifact,
+    payload_wrap_key, request_nonce_expiry, verify_request_mac, wrap_artifact_key,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -33,7 +33,13 @@ use uuid::Uuid;
 use crate::downloads::PayloadRoute;
 use crate::state::{AppState, RateLimiter};
 use crate::store::SessionRecord;
-use crate::tls::{cert_hash_matches, peer_cert_sha256, subject_common_name, PeerCertificates};
+use crate::tls::{PeerCertificates, cert_hash_matches, peer_cert_sha256, subject_common_name};
+
+/// Epoch the payload MAC bodies are computed under. The MAC binds
+/// product+version only — the epoch is a key-derivation input the
+/// client cannot know before the manifest arrives, so both sides fix
+/// it here; the real epoch goes only into the artifact key.
+const MAC_CONTEXT_EPOCH: u32 = 0;
 
 /// Envelope audiences — a grant minted for the client must not verify
 /// as a grant to the application, and vice versa.
@@ -61,11 +67,13 @@ fn api_error_code(status: StatusCode, code: &'static str, msg: impl Into<String>
 }
 
 /// Stable error codes the client parses out of `{"error", "code"}`.
-/// `bad_challenge` and `rate_limited` are transient — retryable, never
-/// a verdict on the session. The artifact codes mark payload failures
-/// that must not kill a session either.
-const CODE_BAD_CHALLENGE: &str = "bad_challenge";
+/// `rate_limited` and `stale_request` are transient — retryable, never
+/// a verdict on the session; a stale request is an honest clock or a
+/// slow network until the client's next drift-corrected attempt says
+/// otherwise. The artifact codes mark payload failures that must not
+/// kill a session either.
 const CODE_RATE_LIMITED: &str = "rate_limited";
+const CODE_STALE_REQUEST: &str = "stale_request";
 const CODE_ARTIFACT_NOT_FOUND: &str = "artifact_not_found";
 const CODE_SESSION_NOT_ACTIVE: &str = "session_not_active";
 const CODE_ARTIFACT_INVALID: &str = "artifact_invalid";
@@ -77,6 +85,7 @@ fn keystone_status(e: &KeystoneError) -> StatusCode {
     match e {
         KeystoneError::InvalidSignature
         | KeystoneError::InvalidMac
+        | KeystoneError::UntrustedIssuer { .. }
         | KeystoneError::ChallengeMismatch => StatusCode::UNAUTHORIZED,
         KeystoneError::AlreadyConsumed => StatusCode::CONFLICT,
         KeystoneError::Expired | KeystoneError::GraceExhausted => StatusCode::GONE,
@@ -95,9 +104,7 @@ fn dead_session_error(reason: DeadReason) -> ApiError {
         DeadReason::Rejected | DeadReason::Revoked => {
             api_error(StatusCode::FORBIDDEN, KeystoneError::Revoked.to_string())
         }
-        DeadReason::Expired => {
-            api_error(StatusCode::GONE, KeystoneError::Expired.to_string())
-        }
+        DeadReason::Expired => api_error(StatusCode::GONE, KeystoneError::Expired.to_string()),
         DeadReason::GraceExhausted => {
             api_error(StatusCode::GONE, KeystoneError::GraceExhausted.to_string())
         }
@@ -122,6 +129,79 @@ fn rate_limit(state: &AppState, key: &str, limit: u32) -> Result<(), ApiError> {
             "rate limited",
         ))
     }
+}
+
+/// The per-session limit every MAC'd route applies before touching
+/// the store — a captured session_id must not buy an unbounded MAC
+/// oracle, and an unknown one burns only its own bucket.
+fn rate_limit_session(
+    state: &AppState,
+    route: &str,
+    session_id: &Uuid,
+    limit: u32,
+) -> Result<(), ApiError> {
+    rate_limit(state, &RateLimiter::session_key(route, session_id), limit)
+}
+
+/// The freshness check every MAC'd route applies right after the rate
+/// limit and before the store lock: `issued_at` is a plaintext field,
+/// so an out-of-window request is rejected without touching any
+/// secret. It is also what bounds the consumed-nonce set — a nonce
+/// only needs remembering until the timestamp alone would reject it.
+fn require_fresh(issued_at: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), ApiError> {
+    check_request_freshness(issued_at, now).map_err(|_| {
+        api_error_code(
+            StatusCode::UNAUTHORIZED,
+            CODE_STALE_REQUEST,
+            "request timestamp outside acceptance window",
+        )
+    })
+}
+
+/// The sha256 of the leaf certificate this request arrived over, if
+/// the transport surfaced one.
+fn presented_cert_sha256(peer_certs: &Option<Extension<PeerCertificates>>) -> Option<[u8; 32]> {
+    peer_certs
+        .as_ref()
+        .and_then(|Extension(peers)| peer_cert_sha256(peers))
+}
+
+/// Certificate continuity: a session exchanged over a pinned cert
+/// must keep arriving over exactly that cert. Runs after the
+/// dead-state check and before the MAC, and fails with the MAC's own
+/// 401 — the caller must never learn the cert was the problem.
+fn require_bound_cert(
+    bound: Option<[u8; 32]>,
+    presented: Option<[u8; 32]>,
+) -> Result<(), ApiError> {
+    let Some(bound) = bound else {
+        return Ok(());
+    };
+    match presented {
+        Some(presented) if cert_hash_matches(&presented, &bound) => Ok(()),
+        _ => Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            KeystoneError::InvalidMac.to_string(),
+        )),
+    }
+}
+
+/// Client-supplied strings never reach a log line verbatim: anything
+/// outside `[A-Za-z0-9._-]` becomes `?` and the result is capped at
+/// 64 characters, so a hostile process name can't smuggle control
+/// characters or a novel into the log.
+pub fn sanitize_for_log(s: &str) -> String {
+    const MAX_LEN: usize = 64;
+    s.chars()
+        .take(MAX_LEN)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 /// Re-resolve the session's grant against the live entitlement
@@ -193,57 +273,31 @@ fn backend_error(e: &KeystoneError) -> ApiError {
     )
 }
 
-/// Consume a server-issued challenge. Unknown, expired, and reused
-/// nonces are indistinguishable — all are 401 `bad_challenge`: a
-/// transient failure the client retries with a fresh challenge, never
-/// a verdict on a session.
-fn consume_challenge(state: &AppState, nonce: &[u8; 32]) -> Result<(), ApiError> {
-    state.challenges.consume(nonce, Utc::now()).map_err(|_| {
-        api_error_code(StatusCode::UNAUTHORIZED, CODE_BAD_CHALLENGE, "invalid challenge")
-    })
-}
-
 /// Reclaim dead weight on every request — cheap, and it keeps the
-/// store and challenge book bounded without a background task.
-async fn sweep_middleware(State(state): State<AppState>, req: axum::extract::Request, next: Next) -> Response {
+/// store bounded without a background task.
+async fn sweep_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
     let now = Utc::now();
     state.store.sweep(now);
-    state.challenges.evict_expired(now);
     next.run(req).await
 }
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/challenge", post(challenge))
         .route("/exchange", post(exchange))
         .route("/attest", post(attest))
         .route("/heartbeat", post(heartbeat))
         .route("/revoke", post(revoke))
         .route("/payload", post(payload_fetch))
         .route("/payload/:product/:version", get(payload_blob))
-        .layer(middleware::from_fn_with_state(state.clone(), sweep_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            sweep_middleware,
+        ))
         .with_state(state)
-}
-
-/// Mint a fresh challenge. The client echoes the nonce into /exchange;
-/// the server records it so only server-issued, unexpired, unspent
-/// nonces are ever accepted.
-async fn challenge(
-    State(state): State<AppState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
-) -> Result<Json<Value>, ApiError> {
-    rate_limit(
-        &state,
-        &RateLimiter::ip_key("challenge", peer.map(|ConnectInfo(a)| a.ip())),
-        state.rate_limits.challenge_per_ip,
-    )?;
-    let c = Challenge::fresh(state.challenge_ttl);
-    state.challenges.issue(c.nonce, c.issued_at + c.ttl);
-    Ok(Json(json!({
-        "nonce": c.nonce,
-        "issued_at": c.issued_at,
-        "ttl_secs": c.ttl.num_seconds(),
-    })))
 }
 
 #[derive(Deserialize)]
@@ -252,9 +306,14 @@ struct ExchangeRequest {
     secret: String,
     product: String,
     /// Client-supplied HWID fingerprint — hashed before storage; an
-    /// anomaly signal, not a hard gate (DESIGN.md: assume spoofable).
+    /// anomaly signal, not a hard gate (README: assume spoofable).
     #[serde(with = "serde_big_array::BigArray")]
     hwid: [u8; 32],
+    /// Client-minted nonce (README: fresh means bound to a challenge
+    /// the verifier issued). Echoed into the envelope so the client can
+    /// tell this response from any earlier one; the server keeps no
+    /// record of it. A replayed request is just another login under
+    /// the same credentials — the credentials are the boundary.
     #[serde(with = "serde_big_array::BigArray")]
     challenge: [u8; 32],
 }
@@ -271,6 +330,10 @@ struct ExchangeBody {
     /// Server clock at issue — the client validates drift against it
     /// (RSW lesson: a static response has no time anchor).
     server_time: DateTime<Utc>,
+    /// Issuer key ids the client must stop trusting. Applied by the
+    /// client after the envelope verifies — the README answer to a
+    /// signing key leaking in a build.
+    revoked_key_ids: Vec<u8>,
 }
 
 async fn exchange(
@@ -295,10 +358,6 @@ async fn exchange(
         state.rate_limits.exchange_per_account,
     )?;
 
-    // The challenge is spent even if auth fails — a burned nonce is
-    // cheaper than a reusable one.
-    consume_challenge(&state, &req.challenge)?;
-
     // Authentication first — always. Running cert checks before the
     // argon2 verify would let an attacker probe account/cert bindings
     // without valid credentials, and answering cert failures
@@ -314,17 +373,17 @@ async fn exchange(
     // Certificate binding: when the account pins a client cert, the
     // TLS peer must present exactly it AND its CN must name the
     // account. Mismatches are indistinguishable from bad credentials —
-    // the response must never confirm the secret was valid.
+    // the response must never confirm the secret was valid. The
+    // presented hash is then recorded on the session so every later
+    // MAC'd request must arrive over the same cert.
+    let mut bound_cert = None;
     if let Some(pinned) = state
         .entitlements
         .cert_sha256(&req.account)
         .await
         .map_err(|e| backend_error(&e))?
     {
-        let presented = peer_certs
-            .as_ref()
-            .and_then(|Extension(peers)| peer_cert_sha256(peers));
-        let Some(presented) = presented else {
+        let Some(presented) = presented_cert_sha256(&peer_certs) else {
             return Err(api_error(StatusCode::UNAUTHORIZED, "invalid credentials"));
         };
         if !cert_hash_matches(&presented, &pinned) {
@@ -341,6 +400,7 @@ async fn exchange(
         if cn.as_deref() != Some(req.account.as_str()) {
             return Err(api_error(StatusCode::UNAUTHORIZED, "invalid credentials"));
         }
+        bound_cert = Some(presented);
     }
 
     // Authorization: what are they allowed. A valid login with no
@@ -358,7 +418,10 @@ async fn exchange(
             )
         })?;
     if now >= grant.expires_at {
-        return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()));
+        return Err(api_error(
+            StatusCode::GONE,
+            KeystoneError::Expired.to_string(),
+        ));
     }
 
     let session_id = Uuid::new_v4();
@@ -376,12 +439,10 @@ async fn exchange(
     // Anomaly signal, not a gate: same account, different fingerprint,
     // short window → flag it. Never blocks — HWID is spoofable by
     // design (facade exists); this feeds investigation, not denial.
-    if state.store.check_fingerprint(
-        &req.account,
-        hwid_hash,
-        now,
-        chrono::Duration::minutes(10),
-    ) {
+    if state
+        .store
+        .check_fingerprint(&req.account, hwid_hash, now, chrono::Duration::minutes(10))
+    {
         tracing::warn!(account = %req.account, "hwid anomaly: new fingerprint within window");
     }
     state.store.insert(SessionRecord {
@@ -391,6 +452,7 @@ async fn exchange(
         hwid_hash,
         session_key,
         entitlement_expires_at: grant.expires_at,
+        cert_sha256: bound_cert,
         state: SessionState::Active {
             lease: lease.clone(),
         },
@@ -404,6 +466,7 @@ async fn exchange(
         session_key,
         lease,
         server_time: now,
+        revoked_key_ids: state.revoked_key_ids_snapshot(),
     })
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -426,8 +489,16 @@ async fn exchange(
 #[derive(Deserialize)]
 struct AttestRequest {
     session_id: Uuid,
+    /// Client-minted nonce, echoed into the envelope and remembered in
+    /// the session's consumed set — a captured attest cannot be replayed
+    /// into a second lease for the same session.
     #[serde(with = "serde_big_array::BigArray")]
     challenge: [u8; 32],
+    /// The client's (drift-adjusted) clock when it minted the request.
+    /// Covered by the MAC and checked against `now ± REQUEST_SKEW`;
+    /// this is what lets the consumed nonce be forgotten after the
+    /// window instead of living as long as the grant.
+    issued_at: DateTime<Utc>,
     /// The application's self-reported identity. Logged as an anomaly
     /// signal — never trusted as proof on its own.
     process_id: String,
@@ -442,29 +513,45 @@ struct AttestRequest {
 struct LeaseBody {
     lease: Lease,
     server_time: DateTime<Utc>,
+    /// Issuer key ids the client must stop trusting — see
+    /// `ExchangeBody`.
+    revoked_key_ids: Vec<u8>,
 }
 
-/// The application's independent attestation (DESIGN.md step 6): the
+/// The application's independent attestation (README step 6): the
 /// app never trusts "the client already checked" — it presents the
 /// session itself, proves session-key possession, and gets its own
-/// signed lease.
+/// signed lease. Like heartbeat, the nonce is the app's own; a
+/// reused one is a 409 replay, not a fresh lease.
 async fn attest(
     State(state): State<AppState>,
+    peer_certs: Option<Extension<PeerCertificates>>,
     Json(req): Json<AttestRequest>,
 ) -> Result<Json<Envelope>, ApiError> {
     let now = Utc::now();
-    consume_challenge(&state, &req.challenge)?;
+    rate_limit_session(
+        &state,
+        "attest",
+        &req.session_id,
+        state.rate_limits.attest_per_session,
+    )?;
+    require_fresh(req.issued_at, now)?;
+    let presented_cert = presented_cert_sha256(&peer_certs);
 
-    // Phase 1, under the store lock: the session must be live and the
-    // MAC must verify before the backend is touched — a valid tag on
-    // a dead session must never reach the entitlement lookup.
+    // Phase 1, under the store lock: the session must be live, the
+    // cert must be the one it was exchanged over, and the MAC must
+    // verify before the backend is touched — a valid tag on a dead
+    // session must never reach the entitlement lookup.
     let (account, product, recorded_expiry) = state
         .store
         .with_mut(&req.session_id, |rec| {
             match &rec.state {
                 SessionState::Active { lease } if !lease.is_expired(now) => {}
                 SessionState::Active { .. } => {
-                    return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()))
+                    return Err(api_error(
+                        StatusCode::GONE,
+                        KeystoneError::Expired.to_string(),
+                    ));
                 }
                 SessionState::Dead { reason } => return Err(dead_session_error(*reason)),
                 // The server is authoritative: it only ever creates
@@ -476,14 +563,27 @@ async fn attest(
                         StatusCode::FORBIDDEN,
                         CODE_SESSION_NOT_ACTIVE,
                         "session not active",
-                    ))
+                    ));
                 }
             }
+            require_bound_cert(rec.cert_sha256, presented_cert)?;
             let mac = req.mac.ok_or_else(|| {
-                api_error(StatusCode::UNAUTHORIZED, KeystoneError::InvalidMac.to_string())
+                api_error(
+                    StatusCode::UNAUTHORIZED,
+                    KeystoneError::InvalidMac.to_string(),
+                )
             })?;
-            verify_response_mac(&rec.session_key, &req.challenge, b"attest", &mac)
-                .map_err(keystone_error)?;
+            verify_request_mac(
+                &rec.session_key,
+                &RequestBinding {
+                    session_id: &rec.session_id,
+                    nonce: &req.challenge,
+                    issued_at: req.issued_at,
+                    context: b"attest",
+                },
+                &mac,
+            )
+            .map_err(keystone_error)?;
             rec.consumed.evict_expired(now);
             Ok((
                 rec.account.clone(),
@@ -495,41 +595,58 @@ async fn attest(
 
     // Phase 2, outside the lock: the grant is re-resolved live — a
     // pull or lapse kills the session now, an extension flows back in.
-    let grant = resolve_live_grant(
-        &state,
-        &req.session_id,
-        &account,
-        &product,
-        recorded_expiry,
-    )
-    .await?;
+    let grant =
+        resolve_live_grant(&state, &req.session_id, &account, &product, recorded_expiry).await?;
 
     // Phase 3, back under the lock: the session may have been revoked
     // while the backend call was in flight — re-check before issuing.
+    // The nonce is consumed here, after the grant check, so a backend
+    // outage doesn't burn it; the check-and-mark stays atomic under
+    // the lock, so exactly one of N concurrent attests wins a nonce.
     let lease = state
         .store
         .with_mut(&req.session_id, |rec| {
             let now = Utc::now();
             rec.entitlement_expires_at = grant.expires_at;
-            match &rec.state {
-                SessionState::Active { lease } if !lease.is_expired(now) => Ok(lease.clone()),
+            let lease = match &rec.state {
+                SessionState::Active { lease } if !lease.is_expired(now) => lease.clone(),
                 SessionState::Active { .. } => {
-                    Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()))
+                    return Err(api_error(
+                        StatusCode::GONE,
+                        KeystoneError::Expired.to_string(),
+                    ));
                 }
-                SessionState::Dead { reason } => Err(dead_session_error(*reason)),
-                SessionState::Grace { .. } => Err(api_error_code(
-                    StatusCode::FORBIDDEN,
-                    CODE_SESSION_NOT_ACTIVE,
-                    "session not active",
-                )),
-            }
+                SessionState::Dead { reason } => return Err(dead_session_error(*reason)),
+                SessionState::Grace { .. } => {
+                    return Err(api_error_code(
+                        StatusCode::FORBIDDEN,
+                        CODE_SESSION_NOT_ACTIVE,
+                        "session not active",
+                    ));
+                }
+            };
+            // Nonces are remembered for the freshness window, not the
+            // rolling lease — a captured attest must stay dead after a
+            // heartbeat moves the lease window forward. That holds
+            // regardless of the lease: once `issued_at + REQUEST_SKEW`
+            // passes, the timestamp check rejects the replay on its
+            // own, so forgetting the nonce then loses nothing.
+            rec.consumed
+                .consume(req.challenge, request_nonce_expiry(req.issued_at))
+                .map_err(keystone_error)?;
+            Ok(lease)
         })
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown session"))??;
 
-    tracing::debug!(session = %sid_tag(&req.session_id), process_id = %req.process_id, "attest");
+    tracing::debug!(
+        session = %sid_tag(&req.session_id),
+        process_id = %sanitize_for_log(&req.process_id),
+        "attest"
+    );
     let body = serde_json::to_vec(&LeaseBody {
         lease: lease.clone(),
         server_time: now,
+        revoked_key_ids: state.revoked_key_ids_snapshot(),
     })
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(Envelope::issue(
@@ -554,10 +671,13 @@ struct HeartbeatRequest {
     session_id: Uuid,
     #[serde(with = "serde_big_array::BigArray")]
     nonce: [u8; 32],
-    /// HMAC over DOMAIN_HEARTBEAT + session_id + nonce, keyed by the
-    /// session key — proves the caller holds the material issued at
-    /// exchange. A captured heartbeat can't be replayed into another
-    /// session.
+    /// The client's (drift-adjusted) clock when it minted the request;
+    /// see `AttestRequest::issued_at`.
+    issued_at: DateTime<Utc>,
+    /// HMAC over DOMAIN_REQUEST_MAC + session_id + nonce + issued_at +
+    /// `b"heartbeat"`, keyed by the session key — proves the caller
+    /// holds the material issued at exchange. A captured heartbeat
+    /// can't be replayed into another session, or outside its window.
     #[serde(with = "serde_big_array::BigArray")]
     mac: [u8; 32],
 }
@@ -567,15 +687,25 @@ struct HeartbeatRequest {
 /// sessions, expired grants, bad MACs, and replays.
 async fn heartbeat(
     State(state): State<AppState>,
+    peer_certs: Option<Extension<PeerCertificates>>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<Envelope>, ApiError> {
     let now = Utc::now();
+    rate_limit_session(
+        &state,
+        "heartbeat",
+        &req.session_id,
+        state.rate_limits.heartbeat_per_session,
+    )?;
+    require_fresh(req.issued_at, now)?;
     let lease_ttl = state.lease_ttl;
     let grace_period = state.grace_period;
+    let presented_cert = presented_cert_sha256(&peer_certs);
 
-    // Phase 1, under the store lock: dead stays dead and the MAC must
-    // verify before the backend is touched — a valid tag on a dead
-    // session must never reach the entitlement lookup. The recorded
+    // Phase 1, under the store lock: dead stays dead, the cert must be
+    // the one the session was exchanged over, and the MAC must verify
+    // before the backend is touched — a valid tag on a dead session
+    // must never reach the entitlement lookup. The recorded
     // entitlement expiry is NOT checked here: it may be stale (a grant
     // extension must be able to rescue the session), so expiry is
     // decided by the live re-resolution below.
@@ -588,7 +718,10 @@ async fn heartbeat(
                 // over — kill it rather than renew a lapsed grant.
                 SessionState::Active { lease } if lease.is_expired(now) => {
                     rec.state.kill(DeadReason::Expired);
-                    return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()));
+                    return Err(api_error(
+                        StatusCode::GONE,
+                        KeystoneError::Expired.to_string(),
+                    ));
                 }
                 SessionState::Active { .. } => {}
                 // The server is authoritative: it only ever creates
@@ -600,11 +733,21 @@ async fn heartbeat(
                         StatusCode::FORBIDDEN,
                         CODE_SESSION_NOT_ACTIVE,
                         "session not active",
-                    ))
+                    ));
                 }
             }
-            verify_heartbeat_mac(&rec.session_key, &rec.session_id, &req.nonce, &req.mac)
-                .map_err(keystone_error)?;
+            require_bound_cert(rec.cert_sha256, presented_cert)?;
+            verify_request_mac(
+                &rec.session_key,
+                &RequestBinding {
+                    session_id: &rec.session_id,
+                    nonce: &req.nonce,
+                    issued_at: req.issued_at,
+                    context: b"heartbeat",
+                },
+                &req.mac,
+            )
+            .map_err(keystone_error)?;
             Ok((
                 rec.account.clone(),
                 rec.product.clone(),
@@ -615,14 +758,8 @@ async fn heartbeat(
 
     // Phase 2, outside the lock: the grant is re-resolved live — a
     // pull or lapse kills the session now, an extension flows back in.
-    let grant = resolve_live_grant(
-        &state,
-        &req.session_id,
-        &account,
-        &product,
-        recorded_expiry,
-    )
-    .await?;
+    let grant =
+        resolve_live_grant(&state, &req.session_id, &account, &product, recorded_expiry).await?;
 
     // Phase 3, back under the lock: the session may have been revoked
     // while the backend call was in flight — re-check before renewing.
@@ -638,7 +775,10 @@ async fn heartbeat(
                 SessionState::Dead { reason } => return Err(dead_session_error(*reason)),
                 SessionState::Active { lease } if lease.is_expired(now) => {
                     rec.state.kill(DeadReason::Expired);
-                    return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()));
+                    return Err(api_error(
+                        StatusCode::GONE,
+                        KeystoneError::Expired.to_string(),
+                    ));
                 }
                 SessionState::Active { .. } => {}
                 SessionState::Grace { .. } => {
@@ -646,7 +786,7 @@ async fn heartbeat(
                         StatusCode::FORBIDDEN,
                         CODE_SESSION_NOT_ACTIVE,
                         "session not active",
-                    ))
+                    ));
                 }
             }
             rec.consumed.evict_expired(now);
@@ -658,13 +798,16 @@ async fn heartbeat(
                 expires_at: std::cmp::min(now + lease_ttl, grant.expires_at),
                 grace_period,
             };
-            // Nonces are remembered for the session's whole life, not
-            // the rolling lease — a captured heartbeat must stay dead
-            // after a renewal moves the lease window forward.
+            // Nonces are remembered for the freshness window, not the
+            // rolling lease — a captured heartbeat must stay dead after
+            // a renewal moves the lease window forward, and it does:
+            // inside the window the consumed set rejects it, past the
+            // window the timestamp check does. Bounded memory, same
+            // guarantee.
             rec.consumed
-                .consume(req.nonce, grant.expires_at)
+                .consume(req.nonce, request_nonce_expiry(req.issued_at))
                 .map_err(keystone_error)?;
-            rec.state.on_heartbeat_ok(lease.clone());
+            rec.state.on_heartbeat_ok(lease.clone(), now);
             Ok(lease)
         })
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown session"))??;
@@ -672,6 +815,7 @@ async fn heartbeat(
     let body = serde_json::to_vec(&LeaseBody {
         lease: lease.clone(),
         server_time: now,
+        revoked_key_ids: state.revoked_key_ids_snapshot(),
     })
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(Envelope::issue(
@@ -690,10 +834,15 @@ async fn heartbeat(
 
 #[derive(Deserialize)]
 struct RevokeRequest {
-    /// Kill one session. Exactly one of session_id/account is required.
+    /// Kill one session. Exactly one of session_id/account/key_id is
+    /// required.
     session_id: Option<Uuid>,
     /// Kill every live session belonging to this account.
     account: Option<String>,
+    /// Declare an issuer key compromised: every live session dies
+    /// (anything it minted may be forged) and clients learn the id
+    /// from their next grant body.
+    key_id: Option<u8>,
     /// Operator credential from KEYSTONE_ADMIN_TOKEN. Optional in the
     /// wire shape so a missing token is a 403, not a parse error.
     admin_token: Option<String>,
@@ -724,8 +873,8 @@ async fn revoke(
     if !authorized {
         return Err(api_error(StatusCode::FORBIDDEN, "forbidden"));
     }
-    match (req.session_id, req.account) {
-        (Some(session_id), None) => {
+    match (req.session_id, req.account, req.key_id) {
+        (Some(session_id), None, None) => {
             if state.store.revoke(&session_id) {
                 tracing::info!(session = %sid_tag(&session_id), "session revoked");
                 Ok(Json(json!({ "revoked": true })))
@@ -733,14 +882,23 @@ async fn revoke(
                 Err(api_error(StatusCode::NOT_FOUND, "unknown session"))
             }
         }
-        (None, Some(account)) => {
+        (None, Some(account), None) => {
             let killed = state.store.revoke_account(&account);
             tracing::info!(account = %account, killed, "account sessions revoked");
             Ok(Json(json!({ "revoked": killed })))
         }
+        (None, None, Some(key_id)) => {
+            // README: revoke the key AND invalidate affected
+            // sessions — the old key stays trusted until clients hear
+            // otherwise, and every session it touched is suspect.
+            state.revoke_key_id(key_id);
+            let killed = state.store.revoke_all(DeadReason::Revoked);
+            tracing::warn!(key_id, killed, "issuer key revoked; all sessions killed");
+            Ok(Json(json!({ "revoked": killed, "key_id": key_id })))
+        }
         _ => Err(api_error(
             StatusCode::BAD_REQUEST,
-            "exactly one of session_id or account is required",
+            "exactly one of session_id, account, or key_id is required",
         )),
     }
 }
@@ -755,6 +913,9 @@ struct PayloadRequest {
     /// can't be unwrapped outside this request.
     #[serde(with = "serde_big_array::BigArray")]
     nonce: [u8; 32],
+    /// The client's (drift-adjusted) clock when it minted the request;
+    /// see `AttestRequest::issued_at`.
+    issued_at: DateTime<Utc>,
     /// Proof of session-key possession — without it a bare session_id
     /// would be a bearer token anyone holding it could fetch with.
     /// Optional in the wire shape so a missing MAC is a 401, not a
@@ -781,17 +942,37 @@ struct PayloadGate {
     wrap_key: [u8; 32],
 }
 
-/// Shared gate for both payload routes: live session, valid MAC, nonce
-/// consumed. Mirrors attest's ordering — dead sessions are rejected
-/// before the MAC so a valid tag can never resurrect a revoked session.
+/// What a payload request presents to the gate.
+struct PayloadProof<'a> {
+    session_id: &'a Uuid,
+    nonce: &'a [u8; 32],
+    /// Already checked against the freshness window by the caller;
+    /// here it binds the MAC and bounds the consumed nonce.
+    issued_at: DateTime<Utc>,
+    mac: Option<&'a [u8; 32]>,
+    /// `payload.fetch:` / `payload.download:` ++ artifact context.
+    mac_body: &'a [u8],
+    /// sha256 of the client cert the request arrived over, if any.
+    presented_cert: Option<[u8; 32]>,
+}
+
+/// Shared gate for both payload routes: live session, same cert as
+/// the exchange, valid MAC, nonce consumed. Mirrors attest's ordering
+/// — dead sessions are rejected before the MAC so a valid tag can
+/// never resurrect a revoked session.
 fn gate_payload_request(
     state: &AppState,
-    session_id: &Uuid,
-    nonce: &[u8; 32],
-    mac: Option<&[u8; 32]>,
-    mac_body: &[u8],
+    proof: PayloadProof<'_>,
 ) -> Result<PayloadGate, ApiError> {
     let now = Utc::now();
+    let PayloadProof {
+        session_id,
+        nonce,
+        issued_at,
+        mac,
+        mac_body,
+        presented_cert,
+    } = proof;
     state
         .store
         .with_mut(session_id, |rec| {
@@ -801,7 +982,10 @@ fn gate_payload_request(
                 // over — kill it rather than serve a lapsed grant.
                 SessionState::Active { .. } => {
                     rec.state.kill(DeadReason::Expired);
-                    return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()))
+                    return Err(api_error(
+                        StatusCode::GONE,
+                        KeystoneError::Expired.to_string(),
+                    ));
                 }
                 SessionState::Dead { reason } => return Err(dead_session_error(*reason)),
                 // The server is authoritative: it only ever creates
@@ -813,20 +997,35 @@ fn gate_payload_request(
                         StatusCode::FORBIDDEN,
                         CODE_SESSION_NOT_ACTIVE,
                         "session not active",
-                    ))
+                    ));
                 }
             };
+            require_bound_cert(rec.cert_sha256, presented_cert)?;
             let mac = mac.ok_or_else(|| {
-                api_error(StatusCode::UNAUTHORIZED, KeystoneError::InvalidMac.to_string())
+                api_error(
+                    StatusCode::UNAUTHORIZED,
+                    KeystoneError::InvalidMac.to_string(),
+                )
             })?;
-            verify_response_mac(&rec.session_key, nonce, mac_body, mac)
-                .map_err(keystone_error)?;
+            verify_request_mac(
+                &rec.session_key,
+                &RequestBinding {
+                    session_id: &rec.session_id,
+                    nonce,
+                    issued_at,
+                    context: mac_body,
+                },
+                mac,
+            )
+            .map_err(keystone_error)?;
             rec.consumed.evict_expired(now);
-            // Nonces are remembered for the session's whole life, not
-            // the rolling lease — a captured MAC must stay dead after
-            // a renewal moves the lease window forward.
+            // Nonces are remembered for the freshness window, not the
+            // rolling lease — a captured MAC must stay dead after a
+            // renewal moves the lease window forward, and it does:
+            // past `issued_at + REQUEST_SKEW` the timestamp check
+            // rejects it without the nonce's help.
             rec.consumed
-                .consume(*nonce, rec.entitlement_expires_at)
+                .consume(*nonce, request_nonce_expiry(issued_at))
                 .map_err(keystone_error)?;
             Ok(PayloadGate {
                 account: rec.account.clone(),
@@ -862,11 +1061,14 @@ fn payload_store(
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "payload store not configured",
-            ))
+            ));
         }
     };
     if !valid_segment(product) || !valid_segment(version) {
-        return Err(api_error(StatusCode::BAD_REQUEST, "invalid product or version"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid product or version",
+        ));
     }
     Ok((dir.join(format!("{product}-{version}.bin")), secret))
 }
@@ -889,7 +1091,11 @@ async fn build_id_for(path: &std::path::Path, sealed: &[u8]) -> String {
 /// refused rather than served.
 async fn read_artifact(path: &PathBuf) -> Result<Vec<u8>, ApiError> {
     let meta = tokio::fs::metadata(path).await.map_err(|_| {
-        api_error_code(StatusCode::NOT_FOUND, CODE_ARTIFACT_NOT_FOUND, "no such payload")
+        api_error_code(
+            StatusCode::NOT_FOUND,
+            CODE_ARTIFACT_NOT_FOUND,
+            "no such payload",
+        )
     })?;
     if meta.len() > MAX_ARTIFACT_BYTES {
         return Err(api_error_code(
@@ -899,7 +1105,11 @@ async fn read_artifact(path: &PathBuf) -> Result<Vec<u8>, ApiError> {
         ));
     }
     let sealed = tokio::fs::read(path).await.map_err(|_| {
-        api_error_code(StatusCode::NOT_FOUND, CODE_ARTIFACT_NOT_FOUND, "no such payload")
+        api_error_code(
+            StatusCode::NOT_FOUND,
+            CODE_ARTIFACT_NOT_FOUND,
+            "no such payload",
+        )
     })?;
     if sealed.len() < 24 + 16 {
         return Err(api_error_code(
@@ -944,8 +1154,8 @@ async fn artifact_plaintext_sha256(
     {
         return Ok(hash);
     }
-    let plaintext = decrypt_artifact(artifact_key, sealed)
-        .map_err(|_| invalid("artifact failed to unseal"))?;
+    let plaintext =
+        decrypt_artifact(artifact_key, sealed).map_err(|_| invalid("artifact failed to unseal"))?;
     let hash: [u8; 32] = Sha256::digest(&plaintext).into();
     if let Some(mtime) = mtime {
         state.artifact_hashes.insert(path.clone(), mtime, hash);
@@ -968,8 +1178,7 @@ fn download_id_for(
     let Some(secret) = &state.watermark_secret else {
         return String::new();
     };
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret)
-        .expect("HMAC accepts any key length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(account.as_bytes());
     mac.update(session_id.as_bytes());
     mac.update(build_id.as_bytes());
@@ -983,21 +1192,39 @@ fn download_id_for(
 /// GET /payload/{product}/{version} so the signed envelope stays small.
 async fn payload_fetch(
     State(state): State<AppState>,
+    peer_certs: Option<Extension<PeerCertificates>>,
     Json(req): Json<PayloadRequest>,
 ) -> Result<Json<Envelope>, ApiError> {
     let now = Utc::now();
+    rate_limit_session(
+        &state,
+        "payload.fetch",
+        &req.session_id,
+        state.rate_limits.payload_fetch_per_session,
+    )?;
+    require_fresh(req.issued_at, now)?;
     let (path, secret) = payload_store(&state, &req.product, &req.version)?;
-    let context = artifact_context(&req.product, &req.version);
     // The MAC binds product+version — a tag minted for one artifact
     // can't be transplanted onto another.
-    let mac_body = [b"payload.fetch:".as_slice(), &context].concat();
+    let mac_body = [
+        b"payload.fetch:".as_slice(),
+        &artifact_context(&req.product, &req.version, MAC_CONTEXT_EPOCH),
+    ]
+    .concat();
     let gate = gate_payload_request(
         &state,
-        &req.session_id,
-        &req.nonce,
-        req.mac.as_ref(),
-        &mac_body,
+        PayloadProof {
+            session_id: &req.session_id,
+            nonce: &req.nonce,
+            issued_at: req.issued_at,
+            mac: req.mac.as_ref(),
+            mac_body: &mac_body,
+            presented_cert: presented_cert_sha256(&peer_certs),
+        },
     )?;
+    // The key derivation, unlike the MAC, runs under the live epoch —
+    // this is where a rotation actually re-keys the artifact.
+    let context = artifact_context(&req.product, &req.version, state.payload_epoch);
 
     // Authorization is re-checked per request, not inherited from the
     // exchange — a grant can lapse or be pulled while the session
@@ -1014,7 +1241,10 @@ async fn payload_fetch(
             )
         })?;
     if now >= grant.expires_at {
-        return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()));
+        return Err(api_error(
+            StatusCode::GONE,
+            KeystoneError::Expired.to_string(),
+        ));
     }
 
     let sealed = read_artifact(&path).await?;
@@ -1029,8 +1259,7 @@ async fn payload_fetch(
     // after decrypting, so the signature must cover what runs, not
     // what sits on disk. The `.sha256` sidecar (or the mtime-keyed
     // cache) supplies it without a per-request decrypt.
-    let plaintext_sha256 =
-        artifact_plaintext_sha256(&state, &path, &artifact_key, &sealed).await?;
+    let plaintext_sha256 = artifact_plaintext_sha256(&state, &path, &artifact_key, &sealed).await?;
 
     let build_id = build_id_for(&path, &sealed).await;
 
@@ -1046,13 +1275,7 @@ async fn payload_fetch(
             build_id: build_id.clone(),
             // Signed per request — a captured manifest ties back to
             // the exact download that produced it.
-            download_id: download_id_for(
-                &state,
-                &gate.account,
-                &req.session_id,
-                &build_id,
-                now,
-            ),
+            download_id: download_id_for(&state, &gate.account, &req.session_id, &build_id, now),
             sha256: plaintext_sha256,
             feature_grants: grant
                 .features
@@ -1066,7 +1289,6 @@ async fn payload_fetch(
             expires_at: manifest_expiry,
         },
     );
-
 
     let body = serde_json::to_vec(&PayloadBody {
         manifest: signed,
@@ -1103,12 +1325,21 @@ async fn payload_fetch(
     )))
 }
 
-/// Parse `Authorization: Keystone <session_id>:<nonce_hex>:<mac_hex>`.
-/// The MAC is over `payload.download:` ++ artifact_context(product,
-/// version) — a tag minted for one artifact can't be transplanted onto
-/// another, and the nonce is consumed per session so a captured header
-/// can't be replayed.
-fn parse_payload_auth(headers: &HeaderMap) -> Result<(Uuid, [u8; 32], [u8; 32]), ApiError> {
+/// The fields the download Authorization header carries.
+struct PayloadAuth {
+    session_id: Uuid,
+    nonce: [u8; 32],
+    issued_at: DateTime<Utc>,
+    mac: [u8; 32],
+}
+
+/// Parse `Authorization: Keystone <session_id>:<nonce_hex>:<issued_at_ms>
+/// :<mac_hex>`. `issued_at_ms` is the client's drift-adjusted clock as
+/// decimal Unix milliseconds. The MAC is over `payload.download:` ++
+/// artifact_context(product, version) — a tag minted for one artifact
+/// can't be transplanted onto another, and the nonce is consumed per
+/// session so a captured header can't be replayed.
+fn parse_payload_auth(headers: &HeaderMap) -> Result<PayloadAuth, ApiError> {
     let bad = || api_error(StatusCode::UNAUTHORIZED, "invalid authorization header");
     let value = headers
         .get(header::AUTHORIZATION)
@@ -1116,18 +1347,31 @@ fn parse_payload_auth(headers: &HeaderMap) -> Result<(Uuid, [u8; 32], [u8; 32]),
         .and_then(|v| v.strip_prefix("Keystone "))
         .ok_or_else(bad)?;
     let mut parts = value.split(':');
-    let session_id: Uuid = parts
+    let session_id: Uuid = parts.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+    let nonce_vec = parts
         .next()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| hex::decode(s).ok())
         .ok_or_else(bad)?;
-    let nonce_vec = parts.next().and_then(|s| hex::decode(s).ok()).ok_or_else(bad)?;
-    let mac_vec = parts.next().and_then(|s| hex::decode(s).ok()).ok_or_else(bad)?;
+    let issued_at = parts
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(DateTime::from_timestamp_millis)
+        .ok_or_else(bad)?;
+    let mac_vec = parts
+        .next()
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(bad)?;
     if parts.next().is_some() {
         return Err(bad());
     }
     let nonce: [u8; 32] = nonce_vec.try_into().map_err(|_| bad())?;
     let mac: [u8; 32] = mac_vec.try_into().map_err(|_| bad())?;
-    Ok((session_id, nonce, mac))
+    Ok(PayloadAuth {
+        session_id,
+        nonce,
+        issued_at,
+        mac,
+    })
 }
 
 /// GET /payload/{product}/{version} — the sealed blob download. Same
@@ -1135,20 +1379,40 @@ fn parse_payload_auth(headers: &HeaderMap) -> Result<(Uuid, [u8; 32], [u8; 32]),
 /// Authorization header because GETs carry no body.
 async fn payload_blob(
     State(state): State<AppState>,
+    peer_certs: Option<Extension<PeerCertificates>>,
     Path((product, version)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Vec<u8>, ApiError> {
     let now = Utc::now();
     let (path, _secret) = payload_store(&state, &product, &version)?;
-    let (session_id, nonce, mac) = parse_payload_auth(&headers)?;
-    let context = artifact_context(&product, &version);
-    let mac_body = [b"payload.download:".as_slice(), &context].concat();
+    let PayloadAuth {
+        session_id,
+        nonce,
+        issued_at,
+        mac,
+    } = parse_payload_auth(&headers)?;
+    rate_limit_session(
+        &state,
+        "payload.download",
+        &session_id,
+        state.rate_limits.payload_download_per_session,
+    )?;
+    require_fresh(issued_at, now)?;
+    let mac_body = [
+        b"payload.download:".as_slice(),
+        &artifact_context(&product, &version, MAC_CONTEXT_EPOCH),
+    ]
+    .concat();
     let gate = gate_payload_request(
         &state,
-        &session_id,
-        &nonce,
-        Some(&mac),
-        &mac_body,
+        PayloadProof {
+            session_id: &session_id,
+            nonce: &nonce,
+            issued_at,
+            mac: Some(&mac),
+            mac_body: &mac_body,
+            presented_cert: presented_cert_sha256(&peer_certs),
+        },
     )?;
 
     // The blob route re-checks the grant — a successful manifest fetch
@@ -1165,7 +1429,10 @@ async fn payload_blob(
             )
         })?;
     if now >= grant.expires_at {
-        return Err(api_error(StatusCode::GONE, KeystoneError::Expired.to_string()));
+        return Err(api_error(
+            StatusCode::GONE,
+            KeystoneError::Expired.to_string(),
+        ));
     }
 
     let sealed = read_artifact(&path).await?;

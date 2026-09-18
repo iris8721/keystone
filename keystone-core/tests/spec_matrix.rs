@@ -13,6 +13,12 @@ fn setup() -> (Issuer, Challenge, Uuid) {
     (issuer, challenge, session)
 }
 
+/// The verifier's trust root for a single issuer — what a build bakes
+/// in at compile time.
+fn trust_for(issuer: &Issuer) -> TrustedIssuers {
+    TrustedIssuers::single(issuer.key_id(), issuer.verifying_key())
+}
+
 fn issue_valid(issuer: &Issuer, challenge: &Challenge, session: Uuid) -> Envelope {
     let now = Utc::now();
     Envelope::issue(
@@ -48,7 +54,7 @@ fn valid_envelope_verifies() {
     let (issuer, challenge, session) = setup();
     let env = issue_valid(&issuer, &challenge, session);
     let now = Utc::now();
-    env.verify(&issuer.verifying_key(), &expect_for(&challenge, &session, now))
+    env.verify(&trust_for(&issuer), &expect_for(&challenge, &session, now))
         .expect("valid envelope must verify");
 }
 
@@ -59,7 +65,7 @@ fn altered_body_rejected() {
     env.body = b"forged-body".to_vec(); // signature no longer matches
     let now = Utc::now();
     assert!(matches!(
-        env.verify(&issuer.verifying_key(), &expect_for(&challenge, &session, now)),
+        env.verify(&trust_for(&issuer), &expect_for(&challenge, &session, now)),
         Err(KeystoneError::InvalidSignature)
     ));
 }
@@ -75,7 +81,7 @@ fn replayed_old_response_rejected() {
     let now = Utc::now();
     assert!(matches!(
         env.verify(
-            &issuer.verifying_key(),
+            &trust_for(&issuer),
             &expect_for(&new_challenge, &session, now)
         ),
         Err(KeystoneError::ChallengeMismatch)
@@ -88,7 +94,7 @@ fn replayed_accepted_response_rejected() {
     let env = issue_valid(&issuer, &challenge, session);
     let now = Utc::now();
 
-    env.verify(&issuer.verifying_key(), &expect_for(&challenge, &session, now))
+    env.verify(&trust_for(&issuer), &expect_for(&challenge, &session, now))
         .unwrap();
 
     let mut consumed = ConsumedSet::new();
@@ -108,7 +114,7 @@ fn expired_envelope_rejected() {
     let later = env.expires_at + Duration::seconds(1);
     assert!(matches!(
         env.verify(
-            &issuer.verifying_key(),
+            &trust_for(&issuer),
             &expect_for(&challenge, &session, later)
         ),
         Err(KeystoneError::Expired)
@@ -118,13 +124,13 @@ fn expired_envelope_rejected() {
     // expires_at`, not `>`. One millisecond before it still verifies.
     assert!(matches!(
         env.verify(
-            &issuer.verifying_key(),
+            &trust_for(&issuer),
             &expect_for(&challenge, &session, env.expires_at)
         ),
         Err(KeystoneError::Expired)
     ));
     env.verify(
-        &issuer.verifying_key(),
+        &trust_for(&issuer),
         &expect_for(
             &challenge,
             &session,
@@ -142,7 +148,7 @@ fn wrong_audience_rejected() {
     let mut expect = expect_for(&challenge, &session, now);
     expect.audience = "some-other-service";
     assert!(matches!(
-        env.verify(&issuer.verifying_key(), &expect),
+        env.verify(&trust_for(&issuer), &expect),
         Err(KeystoneError::AudienceMismatch { .. })
     ));
 }
@@ -156,7 +162,7 @@ fn wrong_operation_rejected() {
     let mut expect = expect_for(&challenge, &session, now);
     expect.operation = "feature.esp";
     assert!(matches!(
-        env.verify(&issuer.verifying_key(), &expect),
+        env.verify(&trust_for(&issuer), &expect),
         Err(KeystoneError::OperationMismatch { .. })
     ));
 }
@@ -169,7 +175,7 @@ fn wrong_session_rejected() {
     let now = Utc::now();
     assert!(matches!(
         env.verify(
-            &issuer.verifying_key(),
+            &trust_for(&issuer),
             &expect_for(&challenge, &other_session, now)
         ),
         Err(KeystoneError::SessionMismatch)
@@ -178,13 +184,16 @@ fn wrong_session_rejected() {
 
 #[test]
 fn wrong_issuer_key_rejected() {
+    // Same key id, different key — the attacker's key must not verify
+    // the real issuer's signature.
     let (issuer, challenge, session) = setup();
     let env = issue_valid(&issuer, &challenge, session);
     let attacker_issuer = Issuer::generate();
+    assert_eq!(attacker_issuer.key_id(), issuer.key_id());
     let now = Utc::now();
     assert!(matches!(
         env.verify(
-            &attacker_issuer.verifying_key(),
+            &trust_for(&attacker_issuer),
             &expect_for(&challenge, &session, now)
         ),
         Err(KeystoneError::InvalidSignature)
@@ -192,31 +201,103 @@ fn wrong_issuer_key_rejected() {
 }
 
 #[test]
-fn response_mac_binds_nonce_and_session() {
+fn request_mac_binds_session_nonce_time_and_operation() {
     let session_key = b"session-secret-material";
+    let session_id = Uuid::new_v4();
+    let other_session = Uuid::new_v4();
     let nonce = [7u8; 32];
-    let body = b"payload-bytes";
+    let other_nonce = [9u8; 32];
+    let at = Utc::now();
+    let later = at + Duration::milliseconds(1);
+    let bind = RequestBinding {
+        session_id: &session_id,
+        nonce: &nonce,
+        issued_at: at,
+        context: b"attest",
+    };
 
-    let mac = mac_response(session_key, &nonce, body);
-    verify_response_mac(session_key, &nonce, body, &mac).unwrap();
+    let mac = mac_request(session_key, &bind);
+    verify_request_mac(session_key, &bind, &mac).unwrap();
 
     // Different nonce — replay into another request fails.
-    let other_nonce = [9u8; 32];
+    let bad = RequestBinding {
+        nonce: &other_nonce,
+        ..bind
+    };
     assert!(matches!(
-        verify_response_mac(session_key, &other_nonce, body, &mac),
+        verify_request_mac(session_key, &bad, &mac),
         Err(KeystoneError::InvalidMac)
     ));
-
     // Different session key — capture replayed into another session fails.
     assert!(matches!(
-        verify_response_mac(b"other-session", &nonce, body, &mac),
+        verify_request_mac(b"other-session", &bind, &mac),
         Err(KeystoneError::InvalidMac)
     ));
-
-    // Altered body fails.
+    // Different session id under the same key — fails.
+    let bad = RequestBinding {
+        session_id: &other_session,
+        ..bind
+    };
     assert!(matches!(
-        verify_response_mac(session_key, &nonce, b"tampered", &mac),
+        verify_request_mac(session_key, &bad, &mac),
         Err(KeystoneError::InvalidMac)
+    ));
+    // Timestamp rewritten by even a millisecond — fails. This is what
+    // stops an attacker refreshing a captured request past the window.
+    let bad = RequestBinding {
+        issued_at: later,
+        ..bind
+    };
+    assert!(matches!(
+        verify_request_mac(session_key, &bad, &mac),
+        Err(KeystoneError::InvalidMac)
+    ));
+    // Different operation — an attest tag can't drive a heartbeat.
+    let bad = RequestBinding {
+        context: b"heartbeat",
+        ..bind
+    };
+    assert!(matches!(
+        verify_request_mac(session_key, &bad, &mac),
+        Err(KeystoneError::InvalidMac)
+    ));
+}
+
+/// The freshness window is symmetric and inclusive at the edges: a
+/// request exactly REQUEST_SKEW old or ahead is accepted; one
+/// millisecond past either edge is ClockSkew.
+#[test]
+fn request_freshness_window_is_symmetric_and_inclusive() {
+    let now = Utc::now();
+    check_request_freshness(now, now).unwrap();
+    check_request_freshness(now - REQUEST_SKEW, now).unwrap();
+    check_request_freshness(now + REQUEST_SKEW, now).unwrap();
+    assert!(matches!(
+        check_request_freshness(now - REQUEST_SKEW - Duration::milliseconds(1), now),
+        Err(KeystoneError::ClockSkew)
+    ));
+    assert!(matches!(
+        check_request_freshness(now + REQUEST_SKEW + Duration::milliseconds(1), now),
+        Err(KeystoneError::ClockSkew)
+    ));
+}
+
+/// A consumed nonce is forgotten exactly when the freshness check would
+/// reject a replay of it on its own — no earlier (replay hole), no later
+/// (unbounded memory).
+#[test]
+fn request_nonce_expiry_matches_freshness_window() {
+    let at = Utc::now();
+    let expiry = request_nonce_expiry(at);
+    assert_eq!(expiry, at + REQUEST_SKEW);
+    // At the expiry instant the freshness check still passes (inclusive
+    // edge), so the nonce must still be held — ConsumedSet evicts on
+    // `expires_at <= now`, so probe one ms before.
+    check_request_freshness(at, expiry - Duration::milliseconds(1)).unwrap();
+    // One ms past expiry the timestamp alone rejects it.
+    assert!(matches!(
+        check_request_freshness(at, expiry + Duration::milliseconds(1)),
+        Err(KeystoneError::ClockSkew)
     ));
 }
 
@@ -280,7 +361,7 @@ fn heartbeat_success_clears_grace() {
         expires_at: now + Duration::minutes(10),
         ..lease
     };
-    state.on_heartbeat_ok(renewed);
+    state.on_heartbeat_ok(renewed, now + Duration::seconds(30));
 
     // A later failure starts a FRESH grace window: deadline t0+60s+2min
     // = t0+180s. Probe strictly PAST the old deadline (t0+120s) — at
@@ -306,10 +387,7 @@ fn explicit_rejection_kills_immediately() {
     };
     let mut state = SessionState::Active { lease };
     state.kill(DeadReason::Revoked);
-    assert!(matches!(
-        state.authorize(now),
-        Err(KeystoneError::Revoked)
-    ));
+    assert!(matches!(state.authorize(now), Err(KeystoneError::Revoked)));
 }
 
 #[test]
@@ -366,7 +444,7 @@ fn every_signed_field_is_actually_signed() {
     let (issuer, challenge, session) = setup();
     let base = issue_valid(&issuer, &challenge, session);
     let now = Utc::now();
-    let key = issuer.verifying_key();
+    let key = trust_for(&issuer);
 
     // Mutating each field post-signing must break the signature.
     let mut e = base.clone();
@@ -440,12 +518,12 @@ fn manifest_build_id_is_signed() {
     };
     let mut signed = SignedManifest::issue(&issuer, manifest);
     signed
-        .verify(&issuer.verifying_key(), now)
+        .verify(&trust_for(&issuer), now)
         .expect("fresh manifest must verify");
 
     signed.manifest.build_id = "build-forged".into();
     assert!(matches!(
-        signed.verify(&issuer.verifying_key(), now),
+        signed.verify(&trust_for(&issuer), now),
         Err(KeystoneError::InvalidSignature)
     ));
 }
@@ -457,11 +535,8 @@ fn envelope_survives_json_roundtrip() {
     let json = serde_json::to_vec(&env).unwrap();
     let back: Envelope = serde_json::from_slice(&json).unwrap();
     let now = Utc::now();
-    back.verify(
-        &issuer.verifying_key(),
-        &expect_for(&challenge, &session, now),
-    )
-    .expect("round-tripped envelope must still verify");
+    back.verify(&trust_for(&issuer), &expect_for(&challenge, &session, now))
+        .expect("round-tripped envelope must still verify");
 
     // Tamper inside the signed `audience` string: mutating a character
     // keeps the JSON valid AND parseable, so verify() is the only
@@ -470,14 +545,11 @@ fn envelope_survives_json_roundtrip() {
     let mut tampered = serde_json::to_value(&env).unwrap();
     tampered["audience"] = serde_json::json!("keystone-servfr");
     let tampered = serde_json::to_vec(&tampered).unwrap();
-    let e: Envelope = serde_json::from_slice(&tampered)
-        .expect("a string-field mutation must still parse");
+    let e: Envelope =
+        serde_json::from_slice(&tampered).expect("a string-field mutation must still parse");
     assert_ne!(e.audience, env.audience, "the tamper must have landed");
     assert!(matches!(
-        e.verify(
-            &issuer.verifying_key(),
-            &expect_for(&challenge, &session, now)
-        ),
+        e.verify(&trust_for(&issuer), &expect_for(&challenge, &session, now)),
         Err(KeystoneError::InvalidSignature)
     ));
 }
@@ -489,14 +561,16 @@ fn accept_once_pipeline() {
     let (issuer, challenge, session) = setup();
     let env = issue_valid(&issuer, &challenge, session);
     let now = Utc::now();
-    let key = issuer.verifying_key();
+    let key = trust_for(&issuer);
     let mut consumed = ConsumedSet::new();
 
-    env.verify(&key, &expect_for(&challenge, &session, now)).unwrap();
+    env.verify(&key, &expect_for(&challenge, &session, now))
+        .unwrap();
     consumed.consume(challenge.nonce, env.expires_at).unwrap();
 
     // Replay: signature still valid, but the nonce is spent.
-    env.verify(&key, &expect_for(&challenge, &session, now)).unwrap();
+    env.verify(&key, &expect_for(&challenge, &session, now))
+        .unwrap();
     assert!(matches!(
         consumed.consume(challenge.nonce, env.expires_at),
         Err(KeystoneError::AlreadyConsumed)
@@ -530,15 +604,59 @@ fn dead_state_stays_dead() {
         expires_at: now + Duration::minutes(10),
         grace_period: Duration::minutes(2),
     };
-    let mut state = SessionState::Active { lease: lease.clone() };
+    let mut state = SessionState::Active {
+        lease: lease.clone(),
+    };
     state.kill(DeadReason::Revoked);
     // A heartbeat arriving after revocation must not resurrect the
     // session — explicit rejection ends access, period.
-    state.on_heartbeat_ok(lease);
+    state.on_heartbeat_ok(lease, now);
+    assert!(matches!(state.authorize(now), Err(KeystoneError::Revoked)));
+}
+
+/// README step 9: grace exhausted → stop. A heartbeat response that
+/// lands after the grace deadline must NOT resurrect the session — the
+/// app was already obliged to stop; a late 200 is not permission to
+/// resume. Verified to fail on the old `on_heartbeat_ok` which promoted
+/// any non-Dead state to Active.
+#[test]
+fn late_heartbeat_after_grace_deadline_does_not_resurrect() {
+    let now = Utc::now();
+    let lease = Lease {
+        session_id: Uuid::new_v4(),
+        granted_at: now,
+        expires_at: now + Duration::minutes(10),
+        grace_period: Duration::minutes(2),
+    };
+    let mut state = SessionState::Active {
+        lease: lease.clone(),
+    };
+    state.on_transient_failure(now); // deadline = now + 2min
+
+    // Response arrives 1s past the deadline — nobody called authorize()
+    // in between, so state is still Grace at this instant.
+    let late = now + Duration::minutes(2) + Duration::seconds(1);
+    state.on_heartbeat_ok(lease, late);
+
     assert!(matches!(
-        state.authorize(now),
-        Err(KeystoneError::Revoked)
+        state,
+        SessionState::Dead {
+            reason: DeadReason::GraceExhausted
+        }
     ));
+    assert!(matches!(
+        state.authorize(late),
+        Err(KeystoneError::GraceExhausted)
+    ));
+    // And it stays dead — a second, on-time heartbeat can't undo it.
+    let fresh = Lease {
+        session_id: Uuid::new_v4(),
+        granted_at: late,
+        expires_at: late + Duration::minutes(10),
+        grace_period: Duration::minutes(2),
+    };
+    state.on_heartbeat_ok(fresh, late + Duration::seconds(1));
+    assert!(matches!(state, SessionState::Dead { .. }));
 }
 
 /// The manifest's download_id is signed like every other attested
@@ -560,12 +678,12 @@ fn manifest_download_id_is_signed() {
     };
     let mut signed = SignedManifest::issue(&issuer, manifest);
     signed
-        .verify(&issuer.verifying_key(), now)
+        .verify(&trust_for(&issuer), now)
         .expect("fresh manifest must verify");
 
     signed.manifest.download_id = "dl-forged".into();
     assert!(matches!(
-        signed.verify(&issuer.verifying_key(), now),
+        signed.verify(&trust_for(&issuer), now),
         Err(KeystoneError::InvalidSignature)
     ));
 }
@@ -593,7 +711,7 @@ fn debug_impls_do_not_leak_secrets() {
             expires_at: Utc::now() + Duration::seconds(300),
             grace_period: Duration::seconds(60),
         },
-        server_pubkey: [0x77; 32],
+        clock_drift_millis: 0,
     };
     let key = [0x42; 32];
     let blob = Handoff::seal(&key, &payload, "game.exe", Duration::seconds(60)).unwrap();
@@ -680,7 +798,7 @@ fn account_debug_redacts_secret_hash() {
 fn every_manifest_field_is_actually_signed() {
     let issuer = Issuer::generate();
     let now = Utc::now();
-    let key = issuer.verifying_key();
+    let key = trust_for(&issuer);
     let base = Manifest {
         product: "prod".into(),
         version: "1.0.0".into(),
@@ -695,7 +813,9 @@ fn every_manifest_field_is_actually_signed() {
         expires_at: now + Duration::minutes(5),
     };
     let signed = SignedManifest::issue(&issuer, base.clone());
-    signed.verify(&key, now).expect("fresh manifest must verify");
+    signed
+        .verify(&key, now)
+        .expect("fresh manifest must verify");
 
     let mut m = signed.clone();
     m.manifest.product = "forged".into();
@@ -780,7 +900,7 @@ fn every_manifest_field_is_actually_signed() {
 fn payload_key_domains_do_not_cross() {
     let ikm = b"shared-input-key-material";
     let salt = b"session-salt";
-    let context = artifact_context("prod", "1.0.0");
+    let context = artifact_context("prod", "1.0.0", 0);
 
     // Salt variation: a different salt derives a different key — the
     // per-session binding is real, not decorative.
@@ -790,25 +910,253 @@ fn payload_key_domains_do_not_cross() {
     // Cross-domain: the payload key and the key-wrap key share HKDF
     // but different domain strings — same ikm+salt must diverge.
     let wrap = payload_wrap_key(&key, &[0x33u8; 32]);
-    assert_ne!(
-        key,
-        derive_payload_key(ikm, salt, b"keystone.key-wrap.v1")
-    );
+    assert_ne!(key, derive_payload_key(ikm, salt, b"keystone.key-wrap.v1"));
     assert_ne!(wrap, key);
 
-    // MAC domains: a heartbeat MAC must never verify as a response
-    // MAC and vice versa, even over identical inputs.
+    // Request MAC operation contexts: a heartbeat tag must never verify
+    // as an attest tag and vice versa, even over identical inputs.
     let session_key = [0x55u8; 32];
     let session_id = Uuid::new_v4();
     let nonce = [0x66u8; 32];
-    let hb = mac_heartbeat(&session_key, &session_id, &nonce);
+    let at = Utc::now();
+    let heartbeat = RequestBinding {
+        session_id: &session_id,
+        nonce: &nonce,
+        issued_at: at,
+        context: b"heartbeat",
+    };
+    let attest = RequestBinding {
+        context: b"attest",
+        ..heartbeat
+    };
+    let hb = mac_request(&session_key, &heartbeat);
     assert!(matches!(
-        verify_response_mac(&session_key, &nonce, &hb, &hb),
+        verify_request_mac(&session_key, &attest, &hb),
         Err(KeystoneError::InvalidMac)
     ));
-    let resp = mac_response(&session_key, &nonce, b"heartbeat");
+    let att = mac_request(&session_key, &attest);
     assert!(matches!(
-        verify_heartbeat_mac(&session_key, &session_id, &nonce, &resp),
+        verify_request_mac(&session_key, &heartbeat, &att),
         Err(KeystoneError::InvalidMac)
     ));
+}
+
+fn manifest_for(now: chrono::DateTime<Utc>) -> Manifest {
+    Manifest {
+        product: "prod".into(),
+        version: "1.0.0".into(),
+        build_id: "build-a1b2c3".into(),
+        download_id: "dl-9f8e7d".into(),
+        sha256: [0u8; 32],
+        feature_grants: vec![],
+        issued_at: now,
+        expires_at: now + Duration::minutes(5),
+    }
+}
+
+/// The key id is inside the signature: re-pointing an envelope at a
+/// different trusted key must fail as a forgery, not resolve to the
+/// other key and verify.
+#[test]
+fn envelope_key_id_is_signed() {
+    let issuer = Issuer::generate_with_id(1);
+    let other = Issuer::generate_with_id(2);
+    let challenge = Challenge::fresh(Duration::seconds(30));
+    let session = Uuid::new_v4();
+    let trusted = TrustedIssuers::new([(1, issuer.verifying_key()), (2, other.verifying_key())]);
+    let now = Utc::now();
+
+    let mut env = issue_valid(&issuer, &challenge, session);
+    assert_eq!(env.key_id, 1);
+    env.verify(&trusted, &expect_for(&challenge, &session, now))
+        .expect("envelope under key 1 must verify");
+
+    env.key_id = 2;
+    assert!(matches!(
+        env.verify(&trusted, &expect_for(&challenge, &session, now)),
+        Err(KeystoneError::InvalidSignature)
+    ));
+}
+
+/// An envelope naming a key id the build never trusted is refused
+/// before any signature math — there is no key to check it against.
+#[test]
+fn unknown_key_id_rejected() {
+    let issuer = Issuer::generate_with_id(1);
+    let rogue = Issuer::generate_with_id(7);
+    let challenge = Challenge::fresh(Duration::seconds(30));
+    let session = Uuid::new_v4();
+    let trusted = trust_for(&issuer);
+    let now = Utc::now();
+
+    // Correctly signed under key 7 — the signature is fine; the key
+    // is simply not one this verifier trusts.
+    let env = issue_valid(&rogue, &challenge, session);
+    assert!(matches!(
+        env.verify(&trusted, &expect_for(&challenge, &session, now)),
+        Err(KeystoneError::UntrustedIssuer { key_id: 7 })
+    ));
+}
+
+/// README §Key rotation: after revocation the leaked key
+/// signs nothing, even though its verifying key is still in the set.
+#[test]
+fn revoked_key_id_rejected() {
+    let (issuer, challenge, session) = setup();
+    let mut trusted = trust_for(&issuer);
+    let now = Utc::now();
+    let env = issue_valid(&issuer, &challenge, session);
+    env.verify(&trusted, &expect_for(&challenge, &session, now))
+        .expect("envelope must verify before revocation");
+
+    trusted.revoke(issuer.key_id());
+    assert!(trusted.is_revoked(issuer.key_id()));
+    assert!(matches!(
+        env.verify(&trusted, &expect_for(&challenge, &session, now)),
+        Err(KeystoneError::UntrustedIssuer { key_id: 1 })
+    ));
+}
+
+/// Rotation without a flag day: a build trusting both the previous and
+/// the current key accepts envelopes from either, and revoking only
+/// the previous one leaves the current one working.
+#[test]
+fn multi_key_set_accepts_current_and_previous() {
+    let previous = Issuer::generate_with_id(1);
+    let current = Issuer::generate_with_id(2);
+    let challenge = Challenge::fresh(Duration::seconds(30));
+    let session = Uuid::new_v4();
+    let mut trusted =
+        TrustedIssuers::new([(1, previous.verifying_key()), (2, current.verifying_key())]);
+    assert_eq!(trusted.key_ids(), vec![1, 2]);
+    let now = Utc::now();
+
+    let from_previous = issue_valid(&previous, &challenge, session);
+    let from_current = issue_valid(&current, &challenge, session);
+    from_previous
+        .verify(&trusted, &expect_for(&challenge, &session, now))
+        .expect("previous key still trusted");
+    from_current
+        .verify(&trusted, &expect_for(&challenge, &session, now))
+        .expect("current key trusted");
+
+    trusted.revoke(1);
+    assert_eq!(trusted.revoked_ids(), vec![1]);
+    assert!(matches!(
+        from_previous.verify(&trusted, &expect_for(&challenge, &session, now)),
+        Err(KeystoneError::UntrustedIssuer { key_id: 1 })
+    ));
+    from_current
+        .verify(&trusted, &expect_for(&challenge, &session, now))
+        .expect("current key unaffected by revoking the previous one");
+}
+
+/// Same as `envelope_key_id_is_signed`, for manifests: the key id is
+/// covered by the signature, and an unknown or revoked id is refused.
+#[test]
+fn manifest_key_id_is_signed() {
+    let issuer = Issuer::generate_with_id(1);
+    let other = Issuer::generate_with_id(2);
+    let mut trusted =
+        TrustedIssuers::new([(1, issuer.verifying_key()), (2, other.verifying_key())]);
+    let now = Utc::now();
+
+    let mut signed = SignedManifest::issue(&issuer, manifest_for(now));
+    assert_eq!(signed.key_id, 1);
+    signed
+        .verify(&trusted, now)
+        .expect("manifest under key 1 must verify");
+
+    signed.key_id = 2;
+    assert!(matches!(
+        signed.verify(&trusted, now),
+        Err(KeystoneError::InvalidSignature)
+    ));
+
+    signed.key_id = 9;
+    assert!(matches!(
+        signed.verify(&trusted, now),
+        Err(KeystoneError::UntrustedIssuer { key_id: 9 })
+    ));
+
+    signed.key_id = 1;
+    trusted.revoke(1);
+    assert!(matches!(
+        signed.verify(&trusted, now),
+        Err(KeystoneError::UntrustedIssuer { key_id: 1 })
+    ));
+}
+
+/// README: payload keys are `HKDF(… || epoch)`. Bumping the epoch
+/// changes the context, so every key derived under the old epoch stops
+/// opening the artifacts sealed under the new one.
+#[test]
+fn artifact_context_binds_epoch() {
+    let secret = [0x5Au8; 32];
+    let plaintext = b"payload bytes";
+
+    let epoch0 = artifact_context("prod", "1.0.0", 0);
+    let epoch1 = artifact_context("prod", "1.0.0", 1);
+    assert_ne!(epoch0, epoch1);
+    assert_eq!(epoch0, artifact_context("prod", "1.0.0", 0));
+
+    let sealed = seal_artifact(&secret, &epoch0, plaintext).unwrap();
+    let key0 = artifact_key_for(&secret, &epoch0, &sealed).unwrap();
+    let key1 = artifact_key_for(&secret, &epoch1, &sealed).unwrap();
+    assert_ne!(key0, key1);
+    assert_eq!(decrypt_artifact(&key0, &sealed).unwrap(), plaintext);
+    assert!(matches!(
+        decrypt_artifact(&key1, &sealed),
+        Err(KeystoneError::InvalidMac)
+    ));
+}
+
+/// The handoff carries session material only. The app's trust root is
+/// baked in at build time — a loader that could hand the app a
+/// verifying key would be a source of trust, which README forbids.
+#[test]
+fn handoff_roundtrip_carries_no_issuer_key() {
+    let session = Uuid::new_v4();
+    let now = Utc::now();
+    let lease = Lease {
+        session_id: session,
+        granted_at: now,
+        expires_at: now + Duration::seconds(300),
+        grace_period: Duration::seconds(60),
+    };
+    // Exhaustive struct literal: a new field here (e.g. a pubkey)
+    // fails to compile, which is the point.
+    let payload = HandoffPayload {
+        session_id: session,
+        session_key: [0xAB; 32],
+        lease: lease.clone(),
+        clock_drift_millis: -1_250,
+    };
+    let key = [0x42u8; 32];
+    let blob = Handoff::seal(&key, &payload, "game.exe", Duration::seconds(60)).unwrap();
+    let opened = blob.open(&key, "game.exe", now).unwrap();
+    assert_eq!(opened.session_id, session);
+    assert_eq!(opened.session_key, [0xAB; 32]);
+    assert_eq!(opened.lease.session_id, lease.session_id);
+    assert_eq!(opened.lease.expires_at, lease.expires_at);
+    assert_eq!(opened.lease.grace_period, lease.grace_period);
+    assert_eq!(
+        opened.clock_drift_millis, -1_250,
+        "the app inherits the loader's drift"
+    );
+
+    // And nothing else crosses: the wire form has exactly these fields —
+    // no pubkey, no credentials.
+    let json = serde_json::to_value(&payload).unwrap();
+    let mut fields: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        ["clock_drift_millis", "lease", "session_id", "session_key"]
+    );
 }

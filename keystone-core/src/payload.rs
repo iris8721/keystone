@@ -11,14 +11,14 @@
 //! a captured blob, and a captured wrap are each useless alone.
 
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit},
 };
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::crypto::{derive_payload_key, DOMAIN_KEY_WRAP};
+use crate::crypto::{DOMAIN_KEY_WRAP, derive_payload_key};
 use crate::error::{KeystoneError, Result};
 
 /// Largest artifact the server will seal or serve and the client will
@@ -43,9 +43,14 @@ pub struct KeyWrap {
 
 /// The per-artifact decryption key: HKDF(artifact_secret,
 /// salt=artifact_nonce, info=DOMAIN_PAYLOAD_KEY + context). `context`
-/// is `crypto::artifact_context(product, version)` — a key derived for
-/// one artifact opens no other.
-pub fn artifact_key(artifact_secret: &[u8; 32], artifact_nonce: &[u8; 24], context: &[u8]) -> [u8; 32] {
+/// is `crypto::artifact_context(product, version, epoch)` — a key
+/// derived for one artifact opens no other, and bumping the epoch
+/// retires every key derived under the previous one.
+pub fn artifact_key(
+    artifact_secret: &[u8; 32],
+    artifact_nonce: &[u8; 24],
+    context: &[u8],
+) -> [u8; 32] {
     derive_payload_key(artifact_secret, artifact_nonce, context)
 }
 

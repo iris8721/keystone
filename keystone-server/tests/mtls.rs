@@ -1,23 +1,29 @@
 //! mTLS tests: a live rustls handshake against the real router.
 //!
-//! Covers the three guarantees the cert_sha256 account binding rests
-//! on: the transport refuses clients without a CA-issued cert, the
+//! Covers the guarantees the cert_sha256 account binding rests on:
+//! the transport refuses clients without a CA-issued cert, the
 //! exchange handler rejects a valid-but-wrong cert for a pinned
-//! account, and the pinned cert itself passes.
+//! account, the pinned cert itself passes — and every MAC'd route
+//! afterwards insists on the cert the session was exchanged over.
+//! Also the startup transport decision (`transport_mode`).
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use keystone_core::{
-    AccountIdentity, Entitlement, EntitlementSource, Issuer, KeystoneError,
+    AccountIdentity, Entitlement, EntitlementSource, Envelope, Issuer, KeystoneError,
+    RequestBinding, artifact_context, mac_request,
 };
-use keystone_server::state::{ArtifactHashes, ChallengeBook, RateLimiter, RateLimits};
-use keystone_server::tls::{load_rustls_config, PeerCertAcceptor};
-use keystone_server::{build_router, AppState, SessionStore};
-use serde_json::{json, Value};
+use keystone_server::state::{ArtifactHashes, RateLimiter, RateLimits};
+use keystone_server::tls::{PeerCertAcceptor, TransportMode, load_rustls_config, transport_mode};
+use keystone_server::{AppState, SessionStore, build_router};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 const ACCOUNT: &str = "dev";
 const SECRET: &str = "devpass";
@@ -119,26 +125,29 @@ fn test_state(pin: Option<(&str, [u8; 32])>) -> AppState {
         pins.insert(account.to_string(), hash);
     }
     AppState {
-        issuer: Arc::new(Issuer::from_bytes(&[7u8; 32])),
+        issuer: Arc::new(Issuer::from_seed(&[7u8; 32], 1)),
         store: SessionStore::new(),
         entitlements: Arc::new(PinnedSource { inner: stub, pins }),
-        challenges: Arc::new(ChallengeBook::new()),
         admin_token_hash: None,
-        challenge_ttl: Duration::seconds(60),
         lease_ttl: Duration::seconds(300),
         grace_period: Duration::seconds(60),
         payload_dir: None,
         payload_secret: None,
+        payload_epoch: 0,
         downloads: None,
         watermark_secret: None,
         rate_limits: RateLimits::default(),
         rate_limiter: Arc::new(RateLimiter::new()),
         artifact_hashes: Arc::new(ArtifactHashes::new()),
+        revoked_key_ids: Arc::new(RwLock::new(BTreeSet::new())),
     }
 }
 
 /// Serve the real router over mTLS on an ephemeral port.
-async fn spawn_mtls_server(state: AppState, ca: &TestCa) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn spawn_mtls_server(
+    state: AppState,
+    ca: &TestCa,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let (cert_pem, key_pem) = issue_server_cert(ca);
     let config = load_rustls_config(
         cert_pem.as_bytes(),
@@ -171,32 +180,33 @@ fn http_client(ca: &TestCa, identity: Option<(&str, &str)>) -> reqwest::Client {
     builder.build().unwrap()
 }
 
-/// POST /challenge then /exchange; returns the exchange status + body.
-async fn exchange(client: &reqwest::Client, addr: SocketAddr) -> (u16, Value) {
-    let base = format!("https://{addr}");
-    let challenge: Value = client
-        .post(format!("{base}/challenge"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let nonce: Vec<u8> = challenge["nonce"]
-        .as_array()
-        .unwrap()
+/// Mint a client-side nonce — the verifier issues the challenge; the
+/// server only ever echoes it.
+fn fresh_nonce() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+    nonce
+}
+
+fn arr32(v: &Value) -> [u8; 32] {
+    v.as_array()
+        .expect("expected a 32-byte array")
         .iter()
         .map(|b| b.as_u64().unwrap() as u8)
-        .collect();
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap()
+}
+
+async fn post_json(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    path: &str,
+    body: Value,
+) -> (u16, Value) {
     let resp = client
-        .post(format!("{base}/exchange"))
-        .json(&json!({
-            "account": ACCOUNT,
-            "secret": SECRET,
-            "product": PRODUCT,
-            "hwid": vec![0u8; 32],
-            "challenge": nonce,
-        }))
+        .post(format!("https://{addr}{path}"))
+        .json(&body)
         .send()
         .await
         .unwrap();
@@ -204,6 +214,167 @@ async fn exchange(client: &reqwest::Client, addr: SocketAddr) -> (u16, Value) {
     let body = resp.json().await.unwrap_or(Value::Null);
     (status, body)
 }
+
+/// POST /exchange with a fresh nonce; returns the status + body.
+async fn exchange(client: &reqwest::Client, addr: SocketAddr) -> (u16, Value) {
+    let nonce = fresh_nonce();
+    post_json(
+        client,
+        addr,
+        "/exchange",
+        json!({
+            "account": ACCOUNT,
+            "secret": SECRET,
+            "product": PRODUCT,
+            "hwid": vec![0u8; 32],
+            "challenge": nonce,
+        }),
+    )
+    .await
+}
+
+/// (session_id, session_key) out of a successful exchange envelope.
+fn session_from(exchange_body: &Value) -> (Uuid, [u8; 32]) {
+    let env: Envelope = serde_json::from_value(exchange_body.clone()).unwrap();
+    let body: Value = serde_json::from_slice(&env.body).unwrap();
+    (
+        serde_json::from_value(body["session_id"].clone()).unwrap(),
+        arr32(&body["session_key"]),
+    )
+}
+
+/// /attest with a fresh challenge and a valid MAC over `client`'s
+/// connection.
+async fn attest(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    session_id: &Uuid,
+    key: &[u8; 32],
+) -> (u16, Value) {
+    let nonce = fresh_nonce();
+    let issued_at = Utc::now();
+    let mac = mac_request(
+        key,
+        &RequestBinding {
+            session_id,
+            nonce: &nonce,
+            issued_at,
+            context: b"attest",
+        },
+    );
+    post_json(
+        client,
+        addr,
+        "/attest",
+        json!({
+            "session_id": session_id,
+            "challenge": nonce,
+            "issued_at": issued_at,
+            "process_id": "dev-app.exe",
+            "mac": mac,
+        }),
+    )
+    .await
+}
+
+/// /heartbeat with a valid MAC over `client`'s connection.
+async fn heartbeat(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    session_id: &Uuid,
+    key: &[u8; 32],
+    nonce: [u8; 32],
+) -> (u16, Value) {
+    let issued_at = Utc::now();
+    let mac = mac_request(
+        key,
+        &RequestBinding {
+            session_id,
+            nonce: &nonce,
+            issued_at,
+            context: b"heartbeat",
+        },
+    );
+    post_json(
+        client,
+        addr,
+        "/heartbeat",
+        json!({ "session_id": session_id, "nonce": nonce, "issued_at": issued_at, "mac": mac }),
+    )
+    .await
+}
+
+/// POST /payload with a valid MAC over `client`'s connection.
+async fn payload_fetch(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    session_id: &Uuid,
+    key: &[u8; 32],
+    nonce: [u8; 32],
+) -> (u16, Value) {
+    // The MAC body is computed under epoch 0 on both sides — the
+    // client can't know the server's live epoch before the manifest.
+    let mac_body = [
+        b"payload.fetch:".as_slice(),
+        &artifact_context(PRODUCT, "1.0.0", 0),
+    ]
+    .concat();
+    let issued_at = Utc::now();
+    let mac = mac_request(
+        key,
+        &RequestBinding {
+            session_id,
+            nonce: &nonce,
+            issued_at,
+            context: &mac_body,
+        },
+    );
+    post_json(
+        client,
+        addr,
+        "/payload",
+        json!({
+            "session_id": session_id,
+            "product": PRODUCT,
+            "version": "1.0.0",
+            "nonce": nonce,
+            "issued_at": issued_at,
+            "mac": mac,
+        }),
+    )
+    .await
+}
+
+/// Two CA-issued client identities for the pinned account plus a
+/// server that pins the first: the shape every cert-continuity test
+/// starts from.
+struct ContinuityRig {
+    addr: SocketAddr,
+    _server: tokio::task::JoinHandle<()>,
+    pinned: reqwest::Client,
+    other: reqwest::Client,
+}
+
+async fn continuity_rig(configure: impl FnOnce(&mut AppState)) -> ContinuityRig {
+    let ca = make_ca();
+    let (pinned_pem, pinned_key, pinned_sha) = issue_client_cert(&ca, ACCOUNT);
+    // Same CA, same CN — valid mTLS, just not the cert the session
+    // was exchanged over.
+    let (other_pem, other_key, _other_sha) = issue_client_cert(&ca, ACCOUNT);
+    let mut state = test_state(Some((ACCOUNT, pinned_sha)));
+    configure(&mut state);
+    let (addr, server) = spawn_mtls_server(state, &ca).await;
+    ContinuityRig {
+        addr,
+        _server: server,
+        pinned: http_client(&ca, Some((&pinned_pem, &pinned_key))),
+        other: http_client(&ca, Some((&other_pem, &other_key))),
+    }
+}
+
+/// The 401 a MAC failure produces — cert-continuity failures must be
+/// byte-identical to it.
+const MAC_FAILURE: &str = "response MAC does not match";
 
 #[tokio::test]
 async fn mtls_rejects_clients_without_cert() {
@@ -214,11 +385,14 @@ async fn mtls_rejects_clients_without_cert() {
     // must fail — this is a TLS-layer rejection, not an HTTP status.
     let client = http_client(&ca, None);
     let err = client
-        .post(format!("https://{addr}/challenge"))
+        .post(format!("https://{addr}/exchange"))
         .send()
         .await
         .expect_err("request without a client cert must fail at TLS");
-    assert!(err.is_connect() || err.is_request(), "expected a TLS-layer failure, got {err}");
+    assert!(
+        err.is_connect() || err.is_request(),
+        "expected a TLS-layer failure, got {err}"
+    );
 }
 
 #[tokio::test]
@@ -242,8 +416,7 @@ async fn cert_sha256_binding_rejects_wrong_cert() {
     // The client presents a different, still CA-issued cert — valid
     // mTLS, wrong binding.
     let (other_pem, other_key, _other_sha) = issue_client_cert(&ca, ACCOUNT);
-    let (addr, _server) =
-        spawn_mtls_server(test_state(Some((ACCOUNT, pinned_sha))), &ca).await;
+    let (addr, _server) = spawn_mtls_server(test_state(Some((ACCOUNT, pinned_sha))), &ca).await;
 
     let client = http_client(&ca, Some((&other_pem, &other_key)));
     let (status, body) = exchange(&client, addr).await;
@@ -291,7 +464,7 @@ async fn mtls_rejects_client_cert_from_foreign_ca() {
 
     let client = http_client(&ca, Some((&rogue_pem, &rogue_key)));
     let err = client
-        .post(format!("https://{addr}/challenge"))
+        .post(format!("https://{addr}/exchange"))
         .send()
         .await
         .expect_err("a foreign-CA client cert must fail the handshake");
@@ -321,7 +494,7 @@ async fn mtls_rejects_expired_client_cert() {
 
     let client = http_client(&ca, Some((&cert_pem, &key_pem)));
     let err = client
-        .post(format!("https://{addr}/challenge"))
+        .post(format!("https://{addr}/exchange"))
         .send()
         .await
         .expect_err("an expired client cert must fail the handshake");
@@ -329,6 +502,119 @@ async fn mtls_rejects_expired_client_cert() {
         err.is_connect() || err.is_request(),
         "expected a TLS-layer failure, got {err}"
     );
+}
+
+/// A session exchanged over a pinned cert must keep arriving over
+/// that cert: a lifted session key on another CA-issued identity
+/// gets the MAC's own 401, never a hint that the cert was the problem.
+#[tokio::test]
+async fn attest_from_different_client_cert_rejected() {
+    let rig = continuity_rig(|_| {}).await;
+    let (status, body) = exchange(&rig.pinned, rig.addr).await;
+    assert_eq!(status, 200, "{body}");
+    let (session_id, key) = session_from(&body);
+
+    let (status, body) = attest(&rig.other, rig.addr, &session_id, &key).await;
+    assert_eq!(status, 401, "expected 401, got {status}: {body}");
+    assert_eq!(body["error"], MAC_FAILURE);
+
+    // The bound cert still attests — the session wasn't harmed.
+    let (status, body) = attest(&rig.pinned, rig.addr, &session_id, &key).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn heartbeat_from_different_client_cert_rejected() {
+    let rig = continuity_rig(|_| {}).await;
+    let (status, body) = exchange(&rig.pinned, rig.addr).await;
+    assert_eq!(status, 200, "{body}");
+    let (session_id, key) = session_from(&body);
+
+    let (status, body) = heartbeat(&rig.other, rig.addr, &session_id, &key, [0x31u8; 32]).await;
+    assert_eq!(status, 401, "expected 401, got {status}: {body}");
+    assert_eq!(body["error"], MAC_FAILURE);
+
+    // The nonce was not consumed by the rejected attempt: the bound
+    // cert can still spend it.
+    let (status, body) = heartbeat(&rig.pinned, rig.addr, &session_id, &key, [0x31u8; 32]).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn payload_from_different_client_cert_rejected() {
+    let dir = std::env::temp_dir().join(format!("keystone-mtls-payload-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rig = continuity_rig(|state| {
+        state.payload_dir = Some(dir);
+        state.payload_secret = Some([0x5Au8; 32]);
+    })
+    .await;
+    let (status, body) = exchange(&rig.pinned, rig.addr).await;
+    assert_eq!(status, 200, "{body}");
+    let (session_id, key) = session_from(&body);
+
+    let (status, body) = payload_fetch(&rig.other, rig.addr, &session_id, &key, [0x41u8; 32]).await;
+    assert_eq!(status, 401, "expected 401, got {status}: {body}");
+    assert_eq!(body["error"], MAC_FAILURE);
+
+    // Over the bound cert the gate passes; with no artifact on disk
+    // the answer is the transient 404 — proof the cert check sits in
+    // front of the artifact lookup, not behind it.
+    let (status, body) =
+        payload_fetch(&rig.pinned, rig.addr, &session_id, &key, [0x42u8; 32]).await;
+    assert_eq!(status, 404, "expected 404, got {status}: {body}");
+    assert_eq!(body["code"], "artifact_not_found");
+}
+
+// ---- transport_mode: the startup refusal ----------------------------
+
+fn p(s: &str) -> Option<PathBuf> {
+    Some(PathBuf::from(s))
+}
+
+/// Cleartext is refused unless KEYSTONE_ALLOW_INSECURE=1 — and the
+/// error names the variable so the operator knows what to set.
+#[test]
+fn plain_http_refused_without_allow_insecure() {
+    let err = transport_mode(None, None, None, false).unwrap_err();
+    assert!(err.contains("KEYSTONE_ALLOW_INSECURE"), "{err}");
+    assert!(err.contains("KEYSTONE_TLS_CERT"), "{err}");
+    assert_eq!(
+        transport_mode(None, None, None, true).unwrap(),
+        TransportMode::Plain
+    );
+}
+
+/// TLS without a client CA is refused the same way; with the flag it
+/// runs as TlsOnly.
+#[test]
+fn tls_without_mtls_refused_without_allow_insecure() {
+    let err = transport_mode(p("s.crt"), p("s.key"), None, false).unwrap_err();
+    assert!(err.contains("KEYSTONE_ALLOW_INSECURE"), "{err}");
+    assert!(err.contains("KEYSTONE_CA_CERT"), "{err}");
+    assert_eq!(
+        transport_mode(p("s.crt"), p("s.key"), None, true).unwrap(),
+        TransportMode::TlsOnly {
+            cert: PathBuf::from("s.crt"),
+            key: PathBuf::from("s.key"),
+        }
+    );
+}
+
+/// Full mTLS needs no flag; a half-configured cert/key pair is a
+/// misconfiguration whatever the flag says.
+#[test]
+fn mtls_starts_without_allow_insecure_and_half_pair_is_refused() {
+    assert_eq!(
+        transport_mode(p("s.crt"), p("s.key"), p("ca.crt"), false).unwrap(),
+        TransportMode::MutualTls {
+            cert: PathBuf::from("s.crt"),
+            key: PathBuf::from("s.key"),
+            ca: PathBuf::from("ca.crt"),
+        }
+    );
+    assert!(transport_mode(p("s.crt"), None, p("ca.crt"), true).is_err());
+    assert!(transport_mode(None, p("s.key"), None, true).is_err());
 }
 
 // ---- subject_common_name DER walk -----------------------------------

@@ -1,27 +1,25 @@
 //! `KeystoneClient` — the SDK surface loaders and payloads link against.
 //!
-//! The client is never the authority (DESIGN.md): it collects
+//! The client is never the authority (README): it collects
 //! credentials, proves session-key possession, and verifies that every
-//! grant it accepts was signed by the one pinned issuer key. Anything
-//! that fails verification is treated as if it never arrived.
+//! grant it accepts was signed by an issuer key in the trusted set
+//! baked into the build. Anything that fails verification is treated
+//! as if it never arrived. The set only ever shrinks at runtime: the
+//! server announces revoked key ids inside signed bodies, and the
+//! client stops trusting them on the spot.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use ed25519_dalek::VerifyingKey;
 use keystone_core::{
-    artifact_context, decrypt_artifact, mac_heartbeat, mac_response, unwrap_artifact_key,
-    Challenge, DeadReason, Envelope, Expectation, KeystoneError, KeyWrap, Lease, SessionState,
-    SignedManifest, MAX_ARTIFACT_BYTES,
-};
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    Challenge, DeadReason, Envelope, Expectation, KeyWrap, KeystoneError, Lease,
+    MAX_ARTIFACT_BYTES, Manifest, RequestBinding, SessionState, SignedManifest, TrustedIssuers,
+    artifact_context, decrypt_artifact, mac_request, unwrap_artifact_key,
 };
 use rustls::client::WebPkiServerVerifier;
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, ServerName, UnixTime,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,12 +39,26 @@ const OP_ATTEST: &str = "session.attest";
 const OP_HEARTBEAT: &str = "session.heartbeat";
 const OP_PAYLOAD_FETCH: &str = "payload.fetch";
 
+/// Epoch used in the artifact context the payload MACs bind. The MAC
+/// binds product+version for a request; the real payload epoch is a
+/// server-side key-derivation input the client never learns before
+/// the manifest arrives, so both sides fix it at 0 here. Must match
+/// routes.rs exactly.
+const MAC_CONTEXT_EPOCH: u32 = 0;
+
 /// Server error codes that mean "transient, not a verdict" — the
 /// session survives these. Must match routes.rs exactly.
-const CODE_BAD_CHALLENGE: &str = "bad_challenge";
 const CODE_ARTIFACT_NOT_FOUND: &str = "artifact_not_found";
 const CODE_SESSION_NOT_ACTIVE: &str = "session_not_active";
 const CODE_RATE_LIMITED: &str = "rate_limited";
+const CODE_STALE_REQUEST: &str = "stale_request";
+
+/// How long the client will accept a response to a challenge it
+/// minted. The verifier issues the nonce (README: "bound to a
+/// challenge/nonce the verifier issued"), so the verifier also owns
+/// the window in which the echo is still fresh. Well above
+/// `REQUEST_TIMEOUT`, so only a clock jump mid-request trips it.
+const CHALLENGE_TTL_SECS: i64 = 60;
 
 /// Hard cap on any single request. Bounded well under any sane
 /// lease_ttl so a blackholed connection surfaces as a transient
@@ -56,14 +68,16 @@ const REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 /// Client for the keystone-server authorization surface.
 ///
-/// `pinned_key` is the whole point: the client trusts exactly one
-/// issuer. No CA, no key rollover, no "trusted" third party — an
-/// envelope that doesn't verify against this key is garbage.
+/// `issuers` is the whole point: the client trusts exactly the issuer
+/// keys baked into the build. No CA, no "trusted" third party, no key
+/// learned from the network — an envelope that doesn't verify against
+/// a live key in this set is garbage. The set is shared by every
+/// clone so a revocation learned on one session applies to all.
 #[derive(Clone)]
 pub struct KeystoneClient {
     http: reqwest::Client,
     base_url: String,
-    pinned_key: VerifyingKey,
+    issuers: Arc<RwLock<TrustedIssuers>>,
 }
 
 /// A client certificate chain + private key for mTLS, both PEM.
@@ -107,12 +121,9 @@ impl PinnedTls {
         // crate-feature default is ambiguous and `builder()` would
         // panic.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let webpki = WebPkiServerVerifier::builder_with_provider(
-            Arc::new(roots),
-            provider.clone(),
-        )
-        .build()
-        .map_err(|e| ClientError::Tls(format!("server verifier: {e}")))?;
+        let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            .build()
+            .map_err(|e| ClientError::Tls(format!("server verifier: {e}")))?;
         let verifier = SpkiPinVerifier {
             inner: webpki,
             pin: self.server_spki_sha256,
@@ -134,12 +145,11 @@ impl PinnedTls {
                         "no certificates in client cert PEM".to_string(),
                     ));
                 }
-                let key: PrivateKeyDer<'static> =
-                    rustls_pemfile::private_key(&mut &id.key_pem[..])
-                        .map_err(|e| ClientError::Tls(format!("client key PEM: {e}")))?
-                        .ok_or_else(|| {
-                            ClientError::Tls("no private key in client key PEM".to_string())
-                        })?;
+                let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &id.key_pem[..])
+                    .map_err(|e| ClientError::Tls(format!("client key PEM: {e}")))?
+                    .ok_or_else(|| {
+                        ClientError::Tls("no private key in client key PEM".to_string())
+                    })?;
                 builder
                     .with_client_auth_cert(certs, key)
                     .map_err(|e| ClientError::Tls(format!("client identity: {e}")))
@@ -219,16 +229,6 @@ impl ServerCertVerifier for SpkiPinVerifier {
     }
 }
 
-
-/// Wire shape of POST /challenge's response.
-#[derive(Deserialize)]
-struct ChallengeResponse {
-    #[serde(with = "serde_big_array::BigArray")]
-    nonce: [u8; 32],
-    issued_at: DateTime<Utc>,
-    ttl_secs: i64,
-}
-
 #[derive(Serialize)]
 struct ExchangeRequest<'a> {
     account: &'a str,
@@ -241,7 +241,9 @@ struct ExchangeRequest<'a> {
 }
 
 /// The signed payload inside an exchange envelope — the only place the
-/// session key ever appears on the wire.
+/// session key ever appears on the wire. Mirrors the server's
+/// `ExchangeBody`; `revoked_key_ids` defaults so a server that predates
+/// key revocation still parses.
 #[derive(Deserialize)]
 struct ExchangeBody {
     session_id: Uuid,
@@ -249,13 +251,20 @@ struct ExchangeBody {
     session_key: [u8; 32],
     lease: Lease,
     server_time: DateTime<Utc>,
+    #[serde(default)]
+    revoked_key_ids: Vec<u8>,
 }
 
+/// Every session-bound request carries `issued_at` — the client's
+/// drift-adjusted clock — under the MAC. The server rejects anything
+/// outside its skew window, which is what lets it forget the nonce
+/// once the window closes instead of remembering it for the grant.
 #[derive(Serialize)]
 struct AttestRequest<'a> {
     session_id: Uuid,
     #[serde(with = "serde_big_array::BigArray")]
     challenge: [u8; 32],
+    issued_at: DateTime<Utc>,
     process_id: &'a str,
     /// Server reads `Option<[u8; 32]>` — a bare array deserializes as
     /// `Some`, and we never send a MAC-less attest.
@@ -268,6 +277,7 @@ struct HeartbeatRequest {
     session_id: Uuid,
     #[serde(with = "serde_big_array::BigArray")]
     nonce: [u8; 32],
+    issued_at: DateTime<Utc>,
     #[serde(with = "serde_big_array::BigArray")]
     mac: [u8; 32],
 }
@@ -285,6 +295,7 @@ struct PayloadRequest<'a> {
     version: &'a str,
     #[serde(with = "serde_big_array::BigArray")]
     nonce: [u8; 32],
+    issued_at: DateTime<Utc>,
     /// Server reads `Option<[u8; 32]>` — a bare array deserializes as
     /// `Some`, and we never send a MAC-less payload request.
     #[serde(with = "serde_big_array::BigArray")]
@@ -300,11 +311,15 @@ struct PayloadBody {
 }
 
 /// Body of attest/heartbeat envelopes: the renewed lease plus the
-/// server's clock for drift checks.
+/// server's clock for drift checks. Mirrors the server's `LeaseBody`;
+/// `revoked_key_ids` defaults so a server that predates key revocation
+/// still parses.
 #[derive(Deserialize)]
 struct LeaseBody {
     lease: Lease,
     server_time: DateTime<Utc>,
+    #[serde(default)]
+    revoked_key_ids: Vec<u8>,
 }
 
 /// What a non-2xx response told us: the HTTP status, the
@@ -319,9 +334,15 @@ struct Rejection {
 impl KeystoneClient {
     /// The primary constructor — pinning is not optional.
     ///
-    /// `base_url` e.g. `https://key.example.com`. `pinned_key` is the
-    /// issuer's ed25519 verifying key, baked into the build — the only
-    /// key this client will ever accept.
+    /// `base_url` e.g. `https://key.example.com`. `issuers` is the set
+    /// of issuer ed25519 verifying keys this client will ever accept,
+    /// keyed by key id. Every consumer — loader and application alike
+    /// — MUST bake its own `TrustedIssuers` into its build: the set is
+    /// never learned from a handoff, a config file, or the network,
+    /// because a party that can supply the trust root can forge every
+    /// grant behind it. The only runtime mutation is shrinkage —
+    /// [`Self::revoke_issuer_key`], or a revocation the server
+    /// announces inside a signed body.
     ///
     /// `ca_cert_pem` is the keystone CA certificate in PEM — the ONLY
     /// trust root this client accepts; the public WebPKI root set is
@@ -341,7 +362,7 @@ impl KeystoneClient {
     /// For dev/test against a local server use [`Self::new_insecure`].
     pub fn new(
         base_url: impl Into<String>,
-        pinned_key: VerifyingKey,
+        issuers: TrustedIssuers,
         ca_cert_pem: impl AsRef<[u8]>,
         server_spki_sha256: [u8; 32],
         identity: Option<ClientIdentity>,
@@ -351,22 +372,22 @@ impl KeystoneClient {
             server_spki_sha256,
             identity,
         };
-        Self::build(base_url.into(), pinned_key, Some(tls), false)
+        Self::build(base_url.into(), issuers, Some(tls), false)
     }
 
     /// WARNING: trusts the public WebPKI root set — any CA-issued cert
     /// for the hostname is accepted, so a compromised or coerced CA
     /// can intercept the transport. Envelope signatures still pin the
-    /// issuer key, but the TLS layer gets no keystone-specific
+    /// issuer set, but the TLS layer gets no keystone-specific
     /// protection. Exists for deployments where the keystone CA is
     /// genuinely unavailable; prefer [`Self::new`].
     ///
     /// Requires https, same as [`Self::new`].
     pub fn new_unpinned_webpki(
         base_url: impl Into<String>,
-        pinned_key: VerifyingKey,
+        issuers: TrustedIssuers,
     ) -> Result<Self, ClientError> {
-        Self::build(base_url.into(), pinned_key, None, false)
+        Self::build(base_url.into(), issuers, None, false)
     }
 
     /// Dev/test constructor: permits `http://` base URLs. Never ship
@@ -374,14 +395,14 @@ impl KeystoneClient {
     /// key, and every MAC to anyone on the path.
     pub fn new_insecure(
         base_url: impl Into<String>,
-        pinned_key: VerifyingKey,
+        issuers: TrustedIssuers,
     ) -> Result<Self, ClientError> {
-        Self::build(base_url.into(), pinned_key, None, true)
+        Self::build(base_url.into(), issuers, None, true)
     }
 
     fn build(
         base_url: String,
-        pinned_key: VerifyingKey,
+        issuers: TrustedIssuers,
         tls: Option<PinnedTls>,
         allow_http: bool,
     ) -> Result<Self, ClientError> {
@@ -397,8 +418,60 @@ impl KeystoneClient {
         Ok(Self {
             http,
             base_url,
-            pinned_key,
+            issuers: Arc::new(RwLock::new(issuers)),
         })
+    }
+
+    /// Stop trusting issuer key `key_id` — immediately, for this client
+    /// and every clone sharing its set. Envelopes and manifests signed
+    /// by it fail verification from the next call on (README: revoke
+    /// the key AND invalidate affected sessions; the server handles
+    /// the sessions). Revocation is permanent for the process: there
+    /// is deliberately no way to re-trust a key at runtime.
+    pub fn revoke_issuer_key(&self, key_id: u8) {
+        self.issuers_mut().revoke(key_id);
+    }
+
+    /// Key ids currently accepted for verification — the baked set
+    /// minus every revocation applied so far.
+    pub fn trusted_key_ids(&self) -> Vec<u8> {
+        let issuers = self.issuers();
+        issuers
+            .key_ids()
+            .into_iter()
+            .filter(|&key_id| !issuers.is_revoked(key_id))
+            .collect()
+    }
+
+    /// Whether `key_id` has been revoked on this client.
+    pub fn is_issuer_revoked(&self, key_id: u8) -> bool {
+        self.issuers().is_revoked(key_id)
+    }
+
+    /// Apply revocations a signed body announced. Only ever called
+    /// after the carrying envelope verified — an unverified body must
+    /// not be able to shrink the set (a forged "revoke everything"
+    /// would be a denial of service, not a compromise, but it is still
+    /// an unauthenticated instruction).
+    fn apply_revocations(&self, key_ids: &[u8]) {
+        if key_ids.is_empty() {
+            return;
+        }
+        let mut issuers = self.issuers_mut();
+        for &key_id in key_ids {
+            issuers.revoke(key_id);
+        }
+    }
+
+    /// Read the trusted set. A poisoned lock is recovered rather than
+    /// propagated: the set is only ever shrunk, so a panic mid-revoke
+    /// leaves it at worst more restrictive, never less.
+    fn issuers(&self) -> RwLockReadGuard<'_, TrustedIssuers> {
+        self.issuers.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn issuers_mut(&self) -> RwLockWriteGuard<'_, TrustedIssuers> {
+        self.issuers.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// POST a JSON body, returning the raw response so callers can
@@ -424,10 +497,7 @@ impl KeystoneClient {
         match resp.json::<Value>().await {
             Ok(v) => Rejection {
                 status,
-                code: v
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                code: v.get("code").and_then(Value::as_str).map(str::to_owned),
                 message: v
                     .get("error")
                     .and_then(Value::as_str)
@@ -461,9 +531,11 @@ impl KeystoneClient {
         }
     }
 
-    /// Verify an envelope against the pinned key and the bindings only
-    /// this requester knows: the challenge we sent, the session we're
-    /// in, and the audience/operation this response must be for.
+    /// Verify an envelope against the trusted issuer set and the
+    /// bindings only this requester knows: the challenge we sent, the
+    /// session we're in, and the audience/operation this response must
+    /// be for. The envelope names its key id; an unknown or revoked id
+    /// fails before the signature is even checked.
     ///
     /// `now` is the caller's best clock — session-bound callers pass
     /// `session.now()` so a skewed local clock can't misjudge
@@ -478,8 +550,9 @@ impl KeystoneClient {
         operation: &str,
         now: DateTime<Utc>,
     ) -> Result<(), ClientError> {
+        let issuers = self.issuers();
         env.verify(
-            &self.pinned_key,
+            &issuers,
             &Expectation {
                 challenge,
                 session_id,
@@ -489,6 +562,17 @@ impl KeystoneClient {
             },
         )?;
         Ok(())
+    }
+
+    /// Verify a signed manifest against the trusted issuer set. Sync
+    /// on purpose: the read guard must never be held across an await.
+    fn verify_manifest<'m>(
+        &self,
+        signed: &'m SignedManifest,
+        now: DateTime<Utc>,
+    ) -> Result<&'m Manifest, ClientError> {
+        let issuers = self.issuers();
+        Ok(signed.verify(&issuers, now)?)
     }
 
     /// Gate for session-bound requests. Dead is final — surface the
@@ -509,7 +593,7 @@ impl KeystoneClient {
     }
 
     /// Sessions opened from a handoff owe the server their own
-    /// attestation before any session-bound call — DESIGN.md step 6
+    /// attestation before any session-bound call — README step 6
     /// is not skippable.
     fn ensure_attested(session: &ClientSession) -> Result<(), ClientError> {
         if session.is_pending_attest() {
@@ -520,19 +604,19 @@ impl KeystoneClient {
     }
 
     /// Map a rejection onto the session. The `code` field decides
-    /// first: `bad_challenge`, `artifact_not_found`,
-    /// `session_not_active`, and `rate_limited` are transient — a
-    /// delayed attest or a missing artifact must not murder the
-    /// session. Without a transient code, 401/403/404/410 are verdicts
-    /// — the server looked at the session and said no, so it dies now
-    /// with no grace. Everything else (409, 5xx) is treated like a
-    /// lost response: bounded grace, deadline fixed at first failure.
+    /// first: `artifact_not_found`, `session_not_active`, and
+    /// `rate_limited` are transient — a missing artifact or a session
+    /// caught mid-transition must not murder the session. Without a
+    /// transient code, 401/403/404/410 are verdicts — the server
+    /// looked at the session and said no, so it dies now with no
+    /// grace. Everything else (409, 5xx) is treated like a lost
+    /// response: bounded grace, deadline fixed at first failure.
     fn apply_rejection(session: &mut ClientSession, status: u16, code: Option<&str>) {
         if let Some(
-            CODE_BAD_CHALLENGE
-            | CODE_ARTIFACT_NOT_FOUND
+            CODE_ARTIFACT_NOT_FOUND
             | CODE_SESSION_NOT_ACTIVE
-            | CODE_RATE_LIMITED,
+            | CODE_RATE_LIMITED
+            | CODE_STALE_REQUEST,
         ) = code
         {
             session.on_transient_failure(session.now());
@@ -607,18 +691,22 @@ impl KeystoneClient {
             let body: LeaseBody = serde_json::from_slice(&env.body).map_err(|e| {
                 ClientError::Core(KeystoneError::Malformed(format!("{operation} body: {e}")))
             })?;
-            Ok((body.lease, env.expires_at, body.server_time))
+            Ok((body, env.expires_at))
         }
         .await;
         match accept {
-            Ok((lease, expires_at, server_time)) => {
+            Ok((body, expires_at)) => {
                 // Unreachable in practice — the is_nonce_consumed check
                 // above already rejected a replay — but a consume error
                 // must not install the lease.
                 session.consume_nonce(*challenge, expires_at)?;
-                session.observe_server_time(server_time);
-                session.on_heartbeat_ok(lease.clone());
-                Ok(lease)
+                session.observe_server_time(body.server_time);
+                session.on_heartbeat_ok(body.lease.clone());
+                // The body verified under a still-trusted key — its
+                // revocation list is the server's word, applied now so
+                // the very next envelope from a compromised key fails.
+                self.apply_revocations(&body.revoked_key_ids);
+                Ok(body.lease)
             }
             Err(e) => {
                 session.on_transient_failure(session.now());
@@ -627,27 +715,16 @@ impl KeystoneClient {
         }
     }
 
-    /// Mint a fresh server challenge. The nonce must be echoed into
-    /// the next request and comes back inside the signed envelope —
-    /// that round-trip is the anti-replay binding.
-    pub async fn challenge(&self) -> Result<Challenge, ClientError> {
-        let resp = Self::checked(self.post("/challenge", &Value::Object(Default::default())).await?)
-            .await?;
-        let wire: ChallengeResponse = resp.json().await?;
-        Ok(Challenge::from_parts(
-            wire.nonce,
-            wire.issued_at,
-            Duration::seconds(wire.ttl_secs),
-        ))
-    }
-
     /// Credential exchange: prove account+secret+entitlement, get back
     /// a signed envelope carrying the session id, session key, and
     /// first lease.
     ///
-    /// The envelope's challenge field must equal the nonce we sent —
-    /// a captured exchange response replays with the wrong challenge
-    /// and dies in `verify`.
+    /// The client mints the challenge — the verifier issues the nonce,
+    /// the server echoes it inside the signed envelope. The envelope's
+    /// challenge field must equal the nonce we sent — a captured
+    /// exchange response replays with the wrong challenge and dies in
+    /// `verify`. A response arriving after the challenge's own ttl is
+    /// refused as expired.
     pub async fn exchange(
         &self,
         account: &str,
@@ -655,7 +732,7 @@ impl KeystoneClient {
         product: &str,
         hwid: [u8; 32],
     ) -> Result<ClientSession, ClientError> {
-        let challenge = self.challenge().await?;
+        let challenge = Challenge::fresh(Duration::seconds(CHALLENGE_TTL_SECS));
         let resp = Self::checked(
             self.post(
                 "/exchange",
@@ -670,6 +747,9 @@ impl KeystoneClient {
             .await?,
         )
         .await?;
+        if challenge.is_expired(Utc::now()) {
+            return Err(ClientError::Core(KeystoneError::Expired));
+        }
         let env: Envelope = resp.json().await?;
         // The session_id needed for verification lives inside the
         // signed body; reading it before verify is safe because
@@ -688,23 +768,20 @@ impl KeystoneClient {
             // raw local time is all we have.
             Utc::now(),
         )?;
-        let mut session = ClientSession::new(
-            body.session_id,
-            body.session_key,
-            body.lease,
-            self.pinned_key.to_bytes(),
-        );
+        let mut session = ClientSession::new(body.session_id, body.session_key, body.lease);
         // The exchange envelope is accepted — its nonce is spent so a
         // replay of the same signed response is rejected on sight.
         session.observe_server_time(body.server_time);
         session.consume_nonce(challenge.nonce, env.expires_at)?;
+        self.apply_revocations(&body.revoked_key_ids);
         Ok(session)
     }
 
-    /// Application-side attestation (DESIGN.md step 6): the app never
+    /// Application-side attestation (README step 6): the app never
     /// trusts "the client already checked" — it presents the session,
-    /// proves key possession with a MAC over a fresh server challenge,
-    /// and gets its own signed lease.
+    /// proves key possession with a MAC over a challenge it minted
+    /// itself (bound to the session and a drift-adjusted `issued_at`),
+    /// and gets its own signed lease echoing that challenge.
     ///
     /// Takes `&mut` for the same reason heartbeat does: an explicit
     /// server rejection (401/403/404/410) kills the session — it must
@@ -716,22 +793,24 @@ impl KeystoneClient {
     ) -> Result<Lease, ClientError> {
         Self::ensure_live(session)?;
 
-        // Attest burns a server-issued challenge; if we can't get one
-        // the server is unreachable — same posture as a lost response.
-        let challenge = match self.challenge().await {
-            Ok(c) => c,
-            Err(e) => {
-                session.on_transient_failure(session.now());
-                return Err(e);
-            }
-        };
-        let mac = mac_response(session.session_key()?, &challenge.nonce, b"attest");
+        let challenge = Challenge::fresh(Duration::seconds(CHALLENGE_TTL_SECS));
+        let issued_at = session.now();
+        let mac = mac_request(
+            session.session_key()?,
+            &RequestBinding {
+                session_id: &session.session_id(),
+                nonce: &challenge.nonce,
+                issued_at,
+                context: b"attest",
+            },
+        );
         let resp = match self
             .post(
                 "/attest",
                 &AttestRequest {
                     session_id: session.session_id(),
                     challenge: challenge.nonce,
+                    issued_at,
                     process_id,
                     mac,
                 },
@@ -746,6 +825,14 @@ impl KeystoneClient {
         };
         if !resp.status().is_success() {
             return Err(Self::reject(session, resp).await);
+        }
+        // The challenge's ttl is our own bound on the echo, measured
+        // on the same raw local clock that minted it — drift never
+        // enters. Stale is transient, same as any unverifiable
+        // response.
+        if challenge.is_expired(Utc::now()) {
+            session.on_transient_failure(session.now());
+            return Err(ClientError::Core(KeystoneError::Expired));
         }
         let lease = self
             .accept_lease_envelope(session, resp, &challenge.nonce, AUDIENCE_APP, OP_ATTEST)
@@ -770,7 +857,16 @@ impl KeystoneClient {
 
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
-        let mac = mac_heartbeat(session.session_key()?, &session.session_id(), &nonce);
+        let issued_at = session.now();
+        let mac = mac_request(
+            session.session_key()?,
+            &RequestBinding {
+                session_id: &session.session_id(),
+                nonce: &nonce,
+                issued_at,
+                context: b"heartbeat",
+            },
+        );
 
         let resp = match self
             .post(
@@ -778,6 +874,7 @@ impl KeystoneClient {
                 &HeartbeatRequest {
                     session_id: session.session_id(),
                     nonce,
+                    issued_at,
                     mac,
                 },
             )
@@ -803,14 +900,16 @@ impl KeystoneClient {
     /// Operator path: revoke a session server-side. Requires the admin
     /// token the server was configured with; without one the route is
     /// closed entirely (403).
-    pub async fn revoke(
-        &self,
-        session_id: Uuid,
-        admin_token: &str,
-    ) -> Result<(), ClientError> {
+    pub async fn revoke(&self, session_id: Uuid, admin_token: &str) -> Result<(), ClientError> {
         Self::checked(
-            self.post("/revoke", &RevokeRequest { session_id, admin_token })
-                .await?,
+            self.post(
+                "/revoke",
+                &RevokeRequest {
+                    session_id,
+                    admin_token,
+                },
+            )
+            .await?,
         )
         .await?;
         Ok(())
@@ -819,10 +918,11 @@ impl KeystoneClient {
     /// Fetch the signed manifest and artifact key for a release.
     ///
     /// The request is MAC'd with the session key over a fresh nonce and
-    /// bound to `product:version` — a captured manifest is useless
-    /// without a live session, because both the MAC and the key-wrap
-    /// salt need key material only the session holds. Returns the
-    /// verified manifest plus the unwrapped artifact decryption key.
+    /// drift-adjusted `issued_at`, bound to `product:version` — a
+    /// captured manifest is useless without a live session, because
+    /// both the MAC and the key-wrap salt need key material only the
+    /// session holds. Returns the verified manifest plus the unwrapped
+    /// artifact decryption key.
     ///
     /// Takes `&mut` like attest/heartbeat: an explicit server rejection
     /// kills the session, and the request nonce is consumed so a
@@ -838,10 +938,23 @@ impl KeystoneClient {
 
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
-        // The MAC body binds product+version via the length-prefixed
+        let issued_at = session.now();
+        // The MAC context binds product+version via the length-prefixed
         // artifact context — must match routes.rs byte for byte.
-        let mac_body = [b"payload.fetch:".as_slice(), &artifact_context(product, version)].concat();
-        let mac = mac_response(session.session_key()?, &nonce, &mac_body);
+        let context = [
+            b"payload.fetch:".as_slice(),
+            &artifact_context(product, version, MAC_CONTEXT_EPOCH),
+        ]
+        .concat();
+        let mac = mac_request(
+            session.session_key()?,
+            &RequestBinding {
+                session_id: &session.session_id(),
+                nonce: &nonce,
+                issued_at,
+                context: &context,
+            },
+        );
 
         let resp = match self
             .post(
@@ -851,6 +964,7 @@ impl KeystoneClient {
                     product,
                     version,
                     nonce,
+                    issued_at,
                     mac,
                 },
             )
@@ -895,7 +1009,7 @@ impl KeystoneClient {
             })?;
             // The manifest's own signature is verified here, before it
             // ever reaches the caller — nothing unverified propagates.
-            let manifest = body.manifest.verify(&self.pinned_key, session.now())?;
+            let manifest = self.verify_manifest(&body.manifest, session.now())?;
             // The signed manifest must attest what we asked for — a
             // manifest for another artifact is a mismatch, not a grant.
             if manifest.product != product || manifest.version != version {
@@ -926,10 +1040,11 @@ impl KeystoneClient {
     ///
     /// Fetches the manifest first — the blob is meaningless without the
     /// hash the signature attests — then GETs the sealed artifact with
-    /// a MAC in the Authorization header, decrypts it with the
-    /// unwrapped artifact key, and refuses to return bytes that don't
-    /// match the manifest. Callers get verified plaintext or an error,
-    /// never unverified bytes.
+    /// a MAC in the Authorization header (session id, nonce, and
+    /// drift-adjusted `issued_at` in millis, all under the tag),
+    /// decrypts it with the unwrapped artifact key, and refuses to
+    /// return bytes that don't match the manifest. Callers get verified
+    /// plaintext or an error, never unverified bytes.
     pub async fn download_payload(
         &self,
         session: &mut ClientSession,
@@ -940,13 +1055,26 @@ impl KeystoneClient {
 
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
-        let mac_body =
-            [b"payload.download:".as_slice(), &artifact_context(product, version)].concat();
-        let mac = mac_response(session.session_key()?, &nonce, &mac_body);
+        let issued_at = session.now();
+        let context = [
+            b"payload.download:".as_slice(),
+            &artifact_context(product, version, MAC_CONTEXT_EPOCH),
+        ]
+        .concat();
+        let mac = mac_request(
+            session.session_key()?,
+            &RequestBinding {
+                session_id: &session.session_id(),
+                nonce: &nonce,
+                issued_at,
+                context: &context,
+            },
+        );
         let auth = format!(
-            "Keystone {}:{}:{}",
+            "Keystone {}:{}:{}:{}",
             session.session_id(),
             hex::encode(nonce),
+            issued_at.timestamp_millis(),
             hex::encode(mac),
         );
 

@@ -2,14 +2,15 @@
 //! launches, and the app opens it and attests against the real server
 //! — the same wire-level harness as client_flow.rs.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 use chrono::{Duration, Utc};
 use ed25519_dalek::VerifyingKey;
 use keystone_client::{ClientError, ClientSession, KeystoneClient};
-use keystone_core::{Entitlement, Issuer, KeystoneError};
+use keystone_core::{Entitlement, HandoffPayload, Issuer, KeystoneError, Lease, TrustedIssuers};
 use keystone_server::entitlement::StubEntitlementSource;
-use keystone_server::state::{ArtifactHashes, ChallengeBook, RateLimiter, RateLimits};
+use keystone_server::state::{ArtifactHashes, RateLimiter, RateLimits};
 use keystone_server::{AppState, SessionStore, build_router};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -20,6 +21,7 @@ const SECRET: &str = "devpass";
 const PRODUCT: &str = "dev-product";
 const ADMIN_TOKEN: &str = "test-admin-token";
 const ISSUER_SEED: [u8; 32] = [7u8; 32];
+const KEY_ID: u8 = 1;
 const PROCESS_ID: &str = "keystone-app-test";
 
 fn test_state(lease_ttl: Duration, grace_period: Duration) -> AppState {
@@ -34,21 +36,21 @@ fn test_state(lease_ttl: Duration, grace_period: Duration) -> AppState {
         }],
     )]));
     AppState {
-        issuer: Arc::new(Issuer::from_bytes(&ISSUER_SEED)),
+        issuer: Arc::new(Issuer::from_seed(&ISSUER_SEED, KEY_ID)),
         store: SessionStore::new(),
         entitlements,
-        challenges: Arc::new(ChallengeBook::new()),
         admin_token_hash: Some(Sha256::digest(ADMIN_TOKEN.as_bytes()).into()),
-        challenge_ttl: Duration::seconds(60),
         lease_ttl,
         grace_period,
         payload_dir: None,
         payload_secret: None,
+        payload_epoch: 0,
         downloads: None,
         watermark_secret: None,
         rate_limits: RateLimits::default(),
         rate_limiter: Arc::new(RateLimiter::default()),
         artifact_hashes: Arc::new(ArtifactHashes::default()),
+        revoked_key_ids: Arc::new(RwLock::new(BTreeSet::new())),
     }
 }
 
@@ -62,11 +64,18 @@ async fn spawn_server(state: AppState) -> (String, JoinHandle<()>) {
 }
 
 fn pinned_key() -> VerifyingKey {
-    Issuer::from_bytes(&ISSUER_SEED).verifying_key()
+    Issuer::from_seed(&ISSUER_SEED, KEY_ID).verifying_key()
+}
+
+/// The trust set every build — loader and app alike — bakes in. Both
+/// halves of the handoff derive their client from this, never from
+/// each other.
+fn issuers() -> TrustedIssuers {
+    TrustedIssuers::single(KEY_ID, pinned_key())
 }
 
 fn client_for(base_url: &str) -> KeystoneClient {
-    KeystoneClient::new_insecure(base_url, pinned_key()).unwrap()
+    KeystoneClient::new_insecure(base_url, issuers()).unwrap()
 }
 
 /// The launcher half: exchange, then seal a handoff for the app.
@@ -85,11 +94,10 @@ async fn handoff_roundtrip_yields_identical_session_material() {
     let (blob, key) = session
         .make_handoff(PROCESS_ID, Duration::seconds(60))
         .expect("make_handoff");
-    let mut app = ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now())
-        .expect("from_handoff");
+    let mut app =
+        ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now()).expect("from_handoff");
 
     assert_eq!(app.session_id(), session.session_id());
-    assert_eq!(app.server_pubkey(), pinned_key().to_bytes());
     assert!(app.is_alive());
     // Opened but not yet attested — the pending gate denies authorize.
     assert!(matches!(
@@ -199,17 +207,14 @@ async fn handoff_session_attests_against_real_server() {
     let (blob, key) = session
         .make_handoff(PROCESS_ID, Duration::seconds(60))
         .expect("make_handoff");
-    let mut app = ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now())
-        .expect("from_handoff");
+    let mut app =
+        ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now()).expect("from_handoff");
 
-    // The app builds its own client pinned to the key the blob carried
-    // and performs its own attestation — never trusting the launcher's
-    // word that the session is good.
-    let app_client = KeystoneClient::new_insecure(
-        &base_url,
-        VerifyingKey::from_bytes(&app.server_pubkey()).unwrap(),
-    )
-    .unwrap();
+    // The app builds its own client from the issuer set baked into
+    // ITS build — not from anything the blob carried. A loader that
+    // could hand the app its trust root could hand it a forged one,
+    // so the handoff deliberately has no key to offer.
+    let app_client = KeystoneClient::new_insecure(&base_url, issuers()).unwrap();
     let lease = app_client
         .attest(&mut app, PROCESS_ID)
         .await
@@ -231,13 +236,11 @@ async fn handoff_session_gated_until_attest() {
     let (blob, key) = session
         .make_handoff(PROCESS_ID, Duration::seconds(60))
         .expect("make_handoff");
-    let mut app = ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now())
-        .expect("from_handoff");
-    let app_client = KeystoneClient::new_insecure(
-        &base_url,
-        VerifyingKey::from_bytes(&app.server_pubkey()).unwrap(),
-    )
-    .unwrap();
+    let mut app =
+        ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now()).expect("from_handoff");
+    // Same as above: the app's trust root is its own, never the
+    // loader's.
+    let app_client = KeystoneClient::new_insecure(&base_url, issuers()).unwrap();
 
     // DESIGN step 6 is not skippable: before attest, authorize and
     // every session-bound call fail without touching the wire.
@@ -283,14 +286,76 @@ async fn handoff_ttl_is_clamped_to_five_minutes() {
     // right after it — the cap isn't decorative.
     ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now())
         .expect("clamped handoff must open");
-    let res = ClientSession::from_handoff(
-        &key,
-        &blob,
-        PROCESS_ID,
-        Utc::now() + Duration::minutes(6),
-    );
+    let res =
+        ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now() + Duration::minutes(6));
     assert!(matches!(
         res,
         Err(ClientError::Core(KeystoneError::Expired))
     ));
+}
+
+/// The loader is never a source of trust: the handoff carries session
+/// material only, and the app verifies the server against the issuer
+/// set baked into ITS OWN build. An app that baked a different key
+/// refuses the same, perfectly valid, session — and no field in the
+/// blob could have told it otherwise.
+#[tokio::test]
+async fn app_pins_baked_issuers_not_handoff() {
+    let (base_url, _server) =
+        spawn_server(test_state(Duration::seconds(300), Duration::seconds(60))).await;
+    let session = exchanged_session(&base_url).await;
+
+    // Compile-time proof: the payload has exactly these fields. Any
+    // trust-root field (an issuer key, a pin) would make this literal
+    // fail to build.
+    let lease = Lease {
+        session_id: session.session_id(),
+        granted_at: Utc::now(),
+        expires_at: Utc::now() + Duration::seconds(300),
+        grace_period: Duration::seconds(60),
+    };
+    let payload = HandoffPayload {
+        session_id: session.session_id(),
+        session_key: [0u8; 32],
+        lease,
+        clock_drift_millis: 0,
+    };
+    let blob =
+        keystone_client::Handoff::seal(&[1u8; 32], &payload, PROCESS_ID, Duration::seconds(60))
+            .expect("seal");
+    let opened = ClientSession::from_handoff(&[1u8; 32], &blob, PROCESS_ID, Utc::now())
+        .expect("a payload of session_id/session_key/lease/clock_drift_millis roundtrips");
+    assert_eq!(opened.session_id(), session.session_id());
+
+    // Runtime proof: the real handoff opens into a session, and what
+    // decides whether the app accepts the server is the set the app
+    // baked — nothing the loader put in the blob.
+    let (blob, key) = session
+        .make_handoff(PROCESS_ID, Duration::seconds(60))
+        .expect("make_handoff");
+    let mut app =
+        ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now()).expect("from_handoff");
+    let other_build = TrustedIssuers::single(
+        KEY_ID,
+        Issuer::from_seed(&[0x42u8; 32], KEY_ID).verifying_key(),
+    );
+    let wrong_app = KeystoneClient::new_insecure(&base_url, other_build).unwrap();
+    let err = wrong_app
+        .attest(&mut app, PROCESS_ID)
+        .await
+        .expect_err("an app that baked a different key must refuse the server");
+    assert!(matches!(
+        err,
+        ClientError::Core(KeystoneError::InvalidSignature)
+    ));
+    // A verification failure is transient — the same session, opened
+    // by an app that baked the right key, attests fine.
+    let mut app =
+        ClientSession::from_handoff(&key, &blob, PROCESS_ID, Utc::now()).expect("from_handoff");
+    let right_app = KeystoneClient::new_insecure(&base_url, issuers()).unwrap();
+    right_app
+        .attest(&mut app, PROCESS_ID)
+        .await
+        .expect("the app's own baked set verifies the server");
+    assert!(app.authorize().is_ok());
 }

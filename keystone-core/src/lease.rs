@@ -35,9 +35,16 @@ impl Lease {
 /// Subsequent failures while in Grace do NOT move it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionState {
-    Active { lease: Lease },
-    Grace { lease: Lease, deadline: DateTime<Utc> },
-    Dead { reason: DeadReason },
+    Active {
+        lease: Lease,
+    },
+    Grace {
+        lease: Lease,
+        deadline: DateTime<Utc>,
+    },
+    Dead {
+        reason: DeadReason,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,12 +58,20 @@ pub enum DeadReason {
 impl SessionState {
     /// Record a successful heartbeat: install the refreshed lease,
     /// clear any grace state. A Dead session stays dead — a heartbeat
-    /// must never resurrect a rejected or revoked session.
-    pub fn on_heartbeat_ok(&mut self, lease: Lease) {
-        if matches!(self, SessionState::Dead { .. }) {
-            return;
+    /// must never resurrect a rejected or revoked session. A Grace
+    /// session whose deadline has already passed is dead too: the
+    /// response arrived after the app was obliged to stop, so it is
+    /// killed here rather than resurrected (README step 9).
+    pub fn on_heartbeat_ok(&mut self, lease: Lease, now: DateTime<Utc>) {
+        match self {
+            SessionState::Dead { .. } => {}
+            SessionState::Grace { deadline, .. } if now > *deadline => {
+                *self = SessionState::Dead {
+                    reason: DeadReason::GraceExhausted,
+                };
+            }
+            _ => *self = SessionState::Active { lease },
         }
-        *self = SessionState::Active { lease };
     }
 
     /// Record a transient failure. First failure starts the grace clock;

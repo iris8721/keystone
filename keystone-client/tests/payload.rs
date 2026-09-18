@@ -2,19 +2,20 @@
 //! sealed-blob download + decrypt + verify, and feature-grant
 //! evaluation.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::{Duration, Utc};
 use ed25519_dalek::VerifyingKey;
 use keystone_client::{ClientError, KeystoneClient};
 use keystone_core::{
-    artifact_context, decrypt_artifact, seal_artifact, Entitlement, FeatureGrant, Issuer,
-    KeystoneError, Manifest, SessionState,
+    Entitlement, FeatureGrant, Issuer, KeystoneError, Manifest, SessionState, TrustedIssuers,
+    artifact_context, decrypt_artifact, seal_artifact,
 };
 use keystone_server::entitlement::StubEntitlementSource;
-use keystone_server::state::{ArtifactHashes, ChallengeBook, RateLimiter, RateLimits};
-use keystone_server::{build_router, AppState, SessionStore};
+use keystone_server::state::{ArtifactHashes, RateLimiter, RateLimits};
+use keystone_server::{AppState, SessionStore, build_router};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -25,8 +26,12 @@ const SECRET: &str = "devpass";
 const PRODUCT: &str = "dev-product";
 const VERSION: &str = "1.0.0";
 const ISSUER_SEED: [u8; 32] = [7u8; 32];
+const KEY_ID: u8 = 1;
 const PAYLOAD_BYTES: &[u8] = b"keystone test payload blob";
 const PAYLOAD_SECRET: [u8; 32] = [0x5Au8; 32];
+/// The server's KEYSTONE_PAYLOAD_EPOCH for these tests; the sealed
+/// fixture must be produced under the same one.
+const PAYLOAD_EPOCH: u32 = 0;
 
 fn test_state(payload_dir: Option<PathBuf>) -> AppState {
     let entitlements = Arc::new(StubEntitlementSource::new(vec![(
@@ -40,21 +45,21 @@ fn test_state(payload_dir: Option<PathBuf>) -> AppState {
         }],
     )]));
     AppState {
-        issuer: Arc::new(Issuer::from_bytes(&ISSUER_SEED)),
+        issuer: Arc::new(Issuer::from_seed(&ISSUER_SEED, KEY_ID)),
         store: SessionStore::new(),
         entitlements,
-        challenges: Arc::new(ChallengeBook::new()),
         admin_token_hash: None,
-        challenge_ttl: Duration::seconds(60),
         lease_ttl: Duration::seconds(300),
         grace_period: Duration::seconds(60),
         payload_dir,
         payload_secret: Some(PAYLOAD_SECRET),
+        payload_epoch: PAYLOAD_EPOCH,
         downloads: None,
         watermark_secret: None,
         rate_limits: RateLimits::default(),
         rate_limiter: Arc::new(RateLimiter::default()),
         artifact_hashes: Arc::new(ArtifactHashes::default()),
+        revoked_key_ids: Arc::new(RwLock::new(BTreeSet::new())),
     }
 }
 
@@ -62,7 +67,7 @@ fn test_state(payload_dir: Option<PathBuf>) -> AppState {
 fn payload_dir_with(product: &str, version: &str, plaintext: &[u8]) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("keystone-client-payload-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let context = artifact_context(product, version);
+    let context = artifact_context(product, version, PAYLOAD_EPOCH);
     let sealed = seal_artifact(&PAYLOAD_SECRET, &context, plaintext).unwrap();
     std::fs::write(dir.join(format!("{product}-{version}.bin")), sealed).unwrap();
     dir
@@ -78,11 +83,15 @@ async fn spawn_server(state: AppState) -> (String, JoinHandle<()>) {
 }
 
 fn client_for(base_url: &str) -> KeystoneClient {
-    KeystoneClient::new_insecure(base_url, pinned_key()).unwrap()
+    KeystoneClient::new_insecure(base_url, issuers()).unwrap()
 }
 
 fn pinned_key() -> VerifyingKey {
-    Issuer::from_bytes(&ISSUER_SEED).verifying_key()
+    Issuer::from_seed(&ISSUER_SEED, KEY_ID).verifying_key()
+}
+
+fn issuers() -> TrustedIssuers {
+    TrustedIssuers::single(KEY_ID, pinned_key())
 }
 
 #[tokio::test]
@@ -100,8 +109,8 @@ async fn fetch_and_download_payload() {
         .await
         .expect("manifest fetch failed");
     // fetch_manifest already verified the signature — the returned
-    // manifest must verify again under the pinned key.
-    let manifest = signed.verify(&pinned_key(), Utc::now()).unwrap();
+    // manifest must verify again under the baked issuer set.
+    let manifest = signed.verify(&issuers(), Utc::now()).unwrap();
     assert_eq!(manifest.product, PRODUCT);
     assert_eq!(manifest.version, VERSION);
     assert_eq!(
@@ -140,8 +149,7 @@ async fn tampered_sealed_blob_fails_decrypt() {
 
     // Flip a ciphertext byte in the sealed blob — the Poly1305 tag
     // must catch it before the manifest hash is even consulted.
-    let mut sealed =
-        std::fs::read(dir.join(format!("{PRODUCT}-{VERSION}.bin"))).unwrap();
+    let mut sealed = std::fs::read(dir.join(format!("{PRODUCT}-{VERSION}.bin"))).unwrap();
     let last = sealed.len() - 1;
     sealed[last] ^= 0xFF;
     let err = decrypt_artifact(&artifact_key, &sealed).unwrap_err();

@@ -1,57 +1,16 @@
 //! Shared application state threaded into every handler.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::Duration;
 use keystone_core::{EntitlementSource, Issuer};
 
 use crate::downloads::DownloadLog;
 use crate::store::SessionStore;
-
-/// Server-issued challenges awaiting consumption. Every nonce the
-/// server mints is recorded here; exchange and attest must present one
-/// that exists, is unexpired, and hasn't been spent — then it's gone.
-/// This is what makes a captured challenge worthless to replay.
-#[derive(Debug, Default)]
-pub struct ChallengeBook {
-    /// nonce → expiry.
-    outstanding: RwLock<HashMap<[u8; 32], DateTime<Utc>>>,
-}
-
-impl ChallengeBook {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn issue(&self, nonce: [u8; 32], expires_at: DateTime<Utc>) {
-        self.outstanding
-            .write()
-            .expect("challenge book poisoned")
-            .insert(nonce, expires_at);
-    }
-
-    /// Find-and-remove in one step. Unknown, expired, and already-spent
-    /// nonces all fail identically — no oracle for which case hit.
-    pub fn consume(&self, nonce: &[u8; 32], now: DateTime<Utc>) -> keystone_core::Result<()> {
-        let mut book = self.outstanding.write().expect("challenge book poisoned");
-        match book.remove(nonce) {
-            Some(expires_at) if now < expires_at => Ok(()),
-            _ => Err(keystone_core::KeystoneError::ChallengeMismatch),
-        }
-    }
-
-    /// Drop expired entries — they can never be accepted anyway.
-    pub fn evict_expired(&self, now: DateTime<Utc>) {
-        self.outstanding
-            .write()
-            .expect("challenge book poisoned")
-            .retain(|_, exp| *exp > now);
-    }
-}
 
 /// Everything a handler needs. Cloning shares the same issuer, store,
 /// and entitlement backend — axum clones state per request.
@@ -62,14 +21,10 @@ pub struct AppState {
     pub issuer: Arc<Issuer>,
     pub store: SessionStore,
     pub entitlements: Arc<dyn EntitlementSource>,
-    pub challenges: Arc<ChallengeBook>,
     /// sha256 of KEYSTONE_ADMIN_TOKEN. Stored hashed so the raw token
     /// never sits in process memory beyond startup; `None` means
     /// /revoke is closed entirely.
     pub admin_token_hash: Option<[u8; 32]>,
-    /// How long a minted challenge stays valid — a stale challenge is
-    /// a replay window.
-    pub challenge_ttl: Duration,
     /// Lease lifetime per grant/renewal. Short on purpose: a lease is
     /// the only thing keeping protected operations alive.
     pub lease_ttl: Duration,
@@ -85,6 +40,11 @@ pub struct AppState {
     /// (KEYSTONE_PAYLOAD_SECRET / KEYSTONE_PAYLOAD_SECRET_FILE). The
     /// sealed blobs are useless without it; it never leaves the server.
     pub payload_secret: Option<[u8; 32]>,
+    /// Rotation counter mixed into every artifact key derivation
+    /// (KEYSTONE_PAYLOAD_EPOCH, default 0). Bumping it re-keys every
+    /// artifact without changing the secret; `xtask seal` must use the
+    /// same value or nothing unseals.
+    pub payload_epoch: u32,
     /// Pseudonymous download records (KEYSTONE_DOWNLOAD_LOG, default
     /// `downloads.jsonl` inside the payload dir; pseudonym secret is
     /// KEYSTONE_WATERMARK_SECRET, falling back to the payload secret).
@@ -101,6 +61,33 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// Plaintext-hash cache for sealed artifacts — see the type.
     pub artifact_hashes: Arc<ArtifactHashes>,
+    /// Issuer key ids this server has declared compromised
+    /// (KEYSTONE_REVOKED_KEY_IDS, plus anything /revoke adds at
+    /// runtime). Shipped to clients in every exchange and lease body
+    /// so a leaked key stops verifying without a rebuild.
+    pub revoked_key_ids: Arc<RwLock<BTreeSet<u8>>>,
+}
+
+impl AppState {
+    /// Snapshot of the revoked issuer ids, ascending — what every
+    /// grant body carries to the client.
+    pub fn revoked_key_ids_snapshot(&self) -> Vec<u8> {
+        self.revoked_key_ids
+            .read()
+            .expect("revoked key set poisoned")
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Declare an issuer key compromised. Returns false when it was
+    /// already revoked.
+    pub fn revoke_key_id(&self, key_id: u8) -> bool {
+        self.revoked_key_ids
+            .write()
+            .expect("revoked key set poisoned")
+            .insert(key_id)
+    }
 }
 
 /// Per-route sliding-window limits. Configured once at startup; tests
@@ -113,21 +100,43 @@ pub struct RateLimits {
     /// /exchange per account — credential stuffing against one account
     /// from rotating IPs must still hit a wall.
     pub exchange_per_account: u32,
-    /// /challenge per source IP — challenges are cheap to mint, so the
-    /// ceiling is generous; it exists to bound the book's growth.
-    pub challenge_per_ip: u32,
     /// /revoke per source IP — admin-gated anyway; the limit keeps a
     /// token-guessing flood from being free.
     pub revoke_per_ip: u32,
+    /// /attest per session — a session_id is enough to drive the
+    /// route, so a captured one must not buy an unbounded MAC oracle.
+    pub attest_per_session: u32,
+    /// /heartbeat per session — the heartbeat loop runs on a schedule;
+    /// anything faster is a client bug or a replay probe.
+    pub heartbeat_per_session: u32,
+    /// POST /payload per session — manifests are signed per request;
+    /// bound the signing budget one session can burn.
+    pub payload_fetch_per_session: u32,
+    /// GET /payload/* per session — blob reads are the most expensive
+    /// thing a session can ask for.
+    pub payload_download_per_session: u32,
 }
+
+// Default per-minute ceilings, grouped so a tuning change is one edit
+// and the Default impl reads as policy rather than a column of literals.
+const DEFAULT_EXCHANGE_PER_IP: u32 = 10;
+const DEFAULT_EXCHANGE_PER_ACCOUNT: u32 = 5;
+const DEFAULT_REVOKE_PER_IP: u32 = 5;
+const DEFAULT_ATTEST_PER_SESSION: u32 = 30;
+const DEFAULT_HEARTBEAT_PER_SESSION: u32 = 30;
+const DEFAULT_PAYLOAD_FETCH_PER_SESSION: u32 = 10;
+const DEFAULT_PAYLOAD_DOWNLOAD_PER_SESSION: u32 = 10;
 
 impl Default for RateLimits {
     fn default() -> Self {
         Self {
-            exchange_per_ip: 10,
-            exchange_per_account: 5,
-            challenge_per_ip: 30,
-            revoke_per_ip: 5,
+            exchange_per_ip: DEFAULT_EXCHANGE_PER_IP,
+            exchange_per_account: DEFAULT_EXCHANGE_PER_ACCOUNT,
+            revoke_per_ip: DEFAULT_REVOKE_PER_IP,
+            attest_per_session: DEFAULT_ATTEST_PER_SESSION,
+            heartbeat_per_session: DEFAULT_HEARTBEAT_PER_SESSION,
+            payload_fetch_per_session: DEFAULT_PAYLOAD_FETCH_PER_SESSION,
+            payload_download_per_session: DEFAULT_PAYLOAD_DOWNLOAD_PER_SESSION,
         }
     }
 }
@@ -184,6 +193,14 @@ impl RateLimiter {
             Some(ip) => format!("{route}:ip:{ip}"),
             None => format!("{route}:ip:unknown"),
         }
+    }
+
+    /// The per-session bucket key, namespaced by route. Keyed by the
+    /// session_id string so the bucket exists before the store is
+    /// consulted — an unknown session burns its own budget, not a
+    /// shared one.
+    pub fn session_key(route: &str, session_id: &uuid::Uuid) -> String {
+        format!("{route}:session:{session_id}")
     }
 }
 
