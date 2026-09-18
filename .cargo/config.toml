@@ -1,0 +1,4 @@
+# `cargo xtask <cmd>` — all build/deploy flows funnel through xtask.
+
+[alias]
+xtask = "run --release --package xtask --"

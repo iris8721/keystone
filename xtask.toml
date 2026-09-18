@@ -1,0 +1,27 @@
+# Keystone build/deploy configuration. Edit for your dev setup.
+#
+# Run everything through:  cargo xtask <cmd>
+#   cargo xtask keygen    — generate the issuer seed, print the pinned pubkey
+#   cargo xtask ca        — generate the keystone CA (mTLS root)
+#   cargo xtask cert      — server TLS cert (CA-signed when a CA exists)
+#   cargo xtask issue-cert <account> — per-account client cert for mTLS
+#   cargo xtask dev       — provision anything missing, then run the server
+
+[target]
+# Machine that runs keystone-server in deployed setups. Deploy shells
+# out to scp/ssh, so the host needs a reachable SSH server and a
+# POSIX-ish remote shell (mkdir -p).
+host = "192.0.2.10"
+username = "keystone"
+
+[deploy]
+# Directory on the target that receives the server binary and keyfile.
+remote_path = "/opt/keystone"
+
+[paths]
+# Workspace-relative locations for generated secrets.
+keyfile = "keystone.key"
+cert = "keystone-cert.pem"
+cert_key = "keystone-key.pem"
+ca_cert = "keystone-ca-cert.pem"
+ca_key = "keystone-ca-key.pem"

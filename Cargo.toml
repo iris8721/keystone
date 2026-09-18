@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "keystone-server",
+    "keystone-core",
+    "keystone-client",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["iris8721"]
+license = "MIT"
+
+[profile.dev]
+opt-level = 1
+debug = true
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
+strip = false
