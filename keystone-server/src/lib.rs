@@ -9,6 +9,7 @@ pub mod accounts;
 pub mod downloads;
 pub mod entitlement;
 pub mod routes;
+pub mod runtime;
 pub mod state;
 pub mod store;
 pub mod tls;

@@ -53,7 +53,7 @@ payload can do without a fresh lease is unprotected.
 | Crate | Role |
 |---|---|
 | `keystone-core` | envelopes, manifests, `TrustedIssuers`, session state machine, replay cache, request MACs, HKDF payload keys, sealed handoff |
-| `keystone-server` | axum: `/exchange` `/attest` `/heartbeat` `/revoke` `POST /payload` `GET /payload/{p}/{v}`; in-memory session store; local accounts file; mTLS |
+| `keystone-server` | axum: `/exchange` `/attest` `/heartbeat` `/revoke` `POST /payload` `GET /payload/{p}/{v}`; in-memory session store; local accounts file; mTLS. Embedders with their own `EntitlementSource` call `keystone_server::runtime::ServerConfig::from_env()?.serve(source)` |
 | `keystone-client` | `KeystoneClient` SDK: pinned TLS, exchange/attest/heartbeat, handoff seal/open, manifest + payload fetch |
 | `xtask` | operator tooling: keygen, CA, certs, accounts, seal, verify, dev, deploy |
 
