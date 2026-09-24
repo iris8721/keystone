@@ -34,6 +34,14 @@ pub enum ClientError {
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
 
+    /// A response body delivered no bytes for `idle`. Transient, like a
+    /// transport failure.
+    #[error("response body stalled for {idle:?}")]
+    Stalled {
+        /// The idle window that elapsed.
+        idle: std::time::Duration,
+    },
+
     /// The session is dead or its lease no longer authorizes anything;
     /// the reason is available from `dead_reason()`.
     #[error("session is not authenticated")]
@@ -57,7 +65,9 @@ impl ClientError {
     /// rejections whose code has a transient verdict.
     pub fn is_retryable(&self) -> bool {
         match self {
-            ClientError::Transport(_) | ClientError::InvalidResponse(_) => true,
+            ClientError::Transport(_)
+            | ClientError::Stalled { .. }
+            | ClientError::InvalidResponse(_) => true,
             ClientError::ServerRejected { code, .. } => {
                 matches!(session_verdict(*code), Verdict::Transient)
             }

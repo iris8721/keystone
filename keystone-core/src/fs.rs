@@ -154,38 +154,69 @@ mod windows {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::OnceLock;
 
     /// Replace inherited entries with a single explicit full-control
-    /// entry for the current user. Only ever narrows access.
+    /// entry for the process token's user. Only ever narrows access.
     pub(super) fn restrict_file(path: &Path) -> io::Result<()> {
-        let grant = format!("{}:F", current_user()?);
+        let grant = format!("*{}:F", user_sid()?);
         icacls(path, &["/inheritance:r", "/grant:r", &grant])
     }
 
     /// Same as `restrict_file`, with the entry inherited by everything
     /// created inside the directory.
     pub(super) fn restrict_dir(path: &Path) -> io::Result<()> {
-        let grant = format!("{}:(OI)(CI)F", current_user()?);
+        let grant = format!("*{}:(OI)(CI)F", user_sid()?);
         icacls(path, &["/inheritance:r", "/grant:r", &grant])
     }
 
-    fn current_user() -> io::Result<String> {
-        match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
-            (Ok(domain), Ok(name)) => Ok(format!("{domain}\\{name}")),
-            (_, Ok(name)) => Ok(name),
-            _ => Err(io::Error::other(
-                "USERNAME is unset; cannot build an owner-only ACL",
-            )),
+    /// The SID of the process token's user, which is right under
+    /// LocalSystem and virtual service accounts where the user name
+    /// variables are not. Failures are not cached, so a later call retries.
+    fn user_sid() -> io::Result<&'static str> {
+        static SID: OnceLock<String> = OnceLock::new();
+        if let Some(sid) = SID.get() {
+            return Ok(sid);
         }
+        let out = Command::new(system32("whoami.exe"))
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "whoami /user failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let sid = parse_whoami_sid(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+            io::Error::other("whoami /user printed no SID; cannot build an owner-only ACL")
+        })?;
+        Ok(SID.get_or_init(|| sid))
+    }
+
+    /// The SID column of `whoami /user /fo csv /nh` output
+    /// (`"domain\user","S-1-5-..."`), if it is a well-formed SID.
+    fn parse_whoami_sid(output: &str) -> Option<String> {
+        let line = output.lines().map(str::trim).find(|l| !l.is_empty())?;
+        let (_, last) = line.rsplit_once(',')?;
+        let sid = last.strip_prefix('"')?.strip_suffix('"')?;
+        let rest = sid.strip_prefix("S-1-")?;
+        let well_formed = rest
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+        well_formed.then(|| sid.to_string())
+    }
+
+    /// A tool from the system directory, never resolved through PATH.
+    fn system32(exe: &str) -> PathBuf {
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        PathBuf::from(system_root).join("System32").join(exe)
     }
 
     fn icacls(path: &Path, args: &[&str]) -> io::Result<()> {
-        // Resolved from the system directory, never from PATH.
-        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-        let exe = PathBuf::from(system_root)
-            .join("System32")
-            .join("icacls.exe");
-        let out = Command::new(exe).arg(path).args(args).output()?;
+        let out = Command::new(system32("icacls.exe"))
+            .arg(path)
+            .args(args)
+            .output()?;
         if out.status.success() {
             Ok(())
         } else {
@@ -195,6 +226,47 @@ mod windows {
                 String::from_utf8_lossy(&out.stdout).trim(),
                 String::from_utf8_lossy(&out.stderr).trim()
             )))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_whoami_sid;
+
+        #[test]
+        fn parses_the_sid_column() {
+            assert_eq!(
+                parse_whoami_sid(
+                    "\"host\\admin\",\"S-1-5-21-1901149633-1796372241-3346877469-1000\"\r\n"
+                )
+                .as_deref(),
+                Some("S-1-5-21-1901149633-1796372241-3346877469-1000")
+            );
+            assert_eq!(
+                parse_whoami_sid("\r\n\"nt authority\\system\",\"S-1-5-18\"\r\n").as_deref(),
+                Some("S-1-5-18")
+            );
+        }
+
+        #[test]
+        fn rejects_anything_that_is_not_a_sid() {
+            for bad in [
+                "",
+                "\"host\\admin\"",
+                "\"host\\admin\",S-1-5-18",
+                "\"host\\admin\",\"S-1-\"",
+                "\"host\\admin\",\"S-1-5--18\"",
+                "\"host\\admin\",\"S-2-5-18\"",
+                "\"host\\admin\",\"S-1-5-18 Everyone\"",
+                "\"host\\admin\",\"*S-1-1-0\"",
+            ] {
+                assert_eq!(parse_whoami_sid(bad), None, "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn the_running_user_resolves_to_a_sid() {
+            assert!(super::user_sid().unwrap().starts_with("S-1-"));
         }
     }
 }

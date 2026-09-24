@@ -17,7 +17,8 @@ use zeroize::Zeroizing;
 use crate::crypto::{DOMAIN_PAYLOAD_WRAP, derive_payload_key, hkdf32};
 use crate::error::{KeystoneError, Result};
 
-/// Largest artifact the server seals or serves and the client downloads.
+/// Largest sealed artifact (nonce, ciphertext, and tag) the server seals or
+/// serves and the client downloads.
 pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Bytes at the start of a sealed artifact that, with the secret and the
@@ -25,6 +26,10 @@ pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 pub const SEALED_PREFIX_LEN: usize = 24;
 
 const TAG_LEN: usize = 16;
+
+/// Largest plaintext [`seal_artifact`] accepts: whatever keeps the sealed
+/// artifact within [`MAX_ARTIFACT_BYTES`].
+pub const MAX_PLAINTEXT_BYTES: u64 = MAX_ARTIFACT_BYTES - SEALED_PREFIX_LEN as u64 - TAG_LEN as u64;
 
 /// Whether `s` is safe as a single path segment on every OS: non-empty
 /// ASCII alphanumerics plus `.`, `_`, `-`; not starting or ending with
@@ -108,12 +113,14 @@ pub fn artifact_key_from_prefix(
     derive_payload_key(artifact_secret, prefix, context)
 }
 
-/// Seal plaintext into the on-disk artifact format.
+/// Seal plaintext into the on-disk artifact format. Plaintext longer than
+/// [`MAX_PLAINTEXT_BYTES`] is `FieldTooLong("plaintext")`.
 pub fn seal_artifact(
     artifact_secret: &[u8; 32],
     context: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    check_plaintext_len(plaintext.len())?;
     let nonce = XChaCha20Poly1305::generate_nonce(&mut rand::thread_rng());
     let nonce_bytes: [u8; SEALED_PREFIX_LEN] = nonce.into();
     let key = artifact_key_from_prefix(artifact_secret, context, &nonce_bytes);
@@ -124,6 +131,13 @@ pub fn seal_artifact(
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
     Ok(out)
+}
+
+fn check_plaintext_len(len: usize) -> Result<()> {
+    if len as u64 > MAX_PLAINTEXT_BYTES {
+        return Err(KeystoneError::FieldTooLong("plaintext"));
+    }
+    Ok(())
 }
 
 /// Decrypt a sealed artifact. Too short is `Malformed`; a wrong key or
@@ -232,6 +246,21 @@ mod tests {
         ] {
             assert!(valid_segment(good), "{good:?} rejected");
         }
+    }
+
+    #[test]
+    fn plaintext_cap_keeps_the_sealed_artifact_within_the_artifact_cap() {
+        assert_eq!(
+            MAX_PLAINTEXT_BYTES + (SEALED_PREFIX_LEN + TAG_LEN) as u64,
+            MAX_ARTIFACT_BYTES
+        );
+        check_plaintext_len(MAX_PLAINTEXT_BYTES as usize).unwrap();
+        // Zeroed allocations are lazily committed, so this stays cheap.
+        let oversized = vec![0u8; MAX_PLAINTEXT_BYTES as usize + 1];
+        assert!(matches!(
+            seal_artifact(&[7u8; 32], b"ctx", &oversized),
+            Err(KeystoneError::FieldTooLong("plaintext"))
+        ));
     }
 
     #[test]

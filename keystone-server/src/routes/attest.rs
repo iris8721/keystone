@@ -18,7 +18,7 @@ use crate::routes::common::{
     ApiError, Grant, Peer, WireJson, features, ip_key, limit, live_grant, now_ms, random32, sign,
 };
 use crate::state::AppState;
-use crate::store::SessionRecord;
+use crate::store::{HandoffRecord, SessionRecord};
 
 fn invalid() -> ApiError {
     ApiError::new(ErrorCode::HandoffInvalid, "handoff is invalid")
@@ -57,42 +57,19 @@ pub(crate) async fn attest(
     }
     // Resolve the grant before spending the handoff: an outage leaves it redeemable.
     let grant = live_grant(&state, &parent).await?;
-    // A full parent bucket must not spend the handoff either.
+    // Reserve the parent's slot before spending the handoff, so a full bucket
+    // never costs a handoff; only a caller holding the handoff secret keeps it.
     let bucket = format!("attest:session:{}", parent.session_id);
-    if !state
-        .inner
-        .limiter
-        .peek(&bucket, limits.attest_per_session, limits.window)
-        .await
-    {
-        return Err(ApiError::rate_limited());
-    }
-
-    let handoff = store
-        .take_handoff(&req.handoff_id)
-        .await
-        .map_err(ApiError::backend)?
-        .ok_or_else(invalid)?;
-    let now = now_ms();
-    if handoff.parent != req.parent_session_id
-        || handoff.process_id != req.process_id
-        || handoff.expires_at <= now
-    {
-        return Err(invalid());
-    }
-    verify_request_mac(
-        &handoff.secret[..],
-        &RequestBinding {
-            session_id: &req.parent_session_id,
-            nonce: &req.challenge,
-            issued_at: req.issued_at,
-            context: &mac_context::attest(&req.handoff_id, &req.process_id),
-        },
-        &req.mac,
-    )
-    .map_err(|_| invalid())?;
-    // Only a caller holding the handoff secret spends the parent's budget.
     limit(&state, &bucket, limits.attest_per_session).await?;
+    let verified = redeem(&state, &req).await;
+    let handoff = match verified {
+        Ok(handoff) => handoff,
+        Err(e) => {
+            state.inner.limiter.refund(&bucket).await;
+            return Err(e);
+        }
+    };
+    let now = now_ms();
     if !peer.may_act_for(&state, &handoff.account).await? {
         return Err(ApiError::new(
             ErrorCode::InvalidCredentials,
@@ -161,4 +138,33 @@ pub(crate) async fn attest(
             },
         },
     )
+}
+
+/// Take the handoff and check it belongs to this request and its MAC holds.
+async fn redeem(state: &AppState, req: &AttestRequest) -> Result<HandoffRecord, ApiError> {
+    let handoff = state
+        .inner
+        .store
+        .take_handoff(&req.handoff_id)
+        .await
+        .map_err(ApiError::backend)?
+        .ok_or_else(invalid)?;
+    if handoff.parent != req.parent_session_id
+        || handoff.process_id != req.process_id
+        || handoff.expires_at <= now_ms()
+    {
+        return Err(invalid());
+    }
+    verify_request_mac(
+        &handoff.secret[..],
+        &RequestBinding {
+            session_id: &req.parent_session_id,
+            nonce: &req.challenge,
+            issued_at: req.issued_at,
+            context: &mac_context::attest(&req.handoff_id, &req.process_id),
+        },
+        &req.mac,
+    )
+    .map_err(|_| invalid())?;
+    Ok(handoff)
 }

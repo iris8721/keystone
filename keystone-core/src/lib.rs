@@ -39,8 +39,8 @@ pub use issuers::TrustedIssuers;
 pub use lease::{DeadReason, Lease, SessionState};
 pub use manifest::{FeatureGrant, Manifest, SignedManifest};
 pub use payload::{
-    ArtifactPaths, KeyWrap, MAX_ARTIFACT_BYTES, SEALED_PREFIX_LEN, artifact_key_from_prefix,
-    decrypt_artifact, payload_wrap_key, seal_artifact, unwrap_artifact_key, unwrap_secret,
-    valid_segment, wrap_secret,
+    ArtifactPaths, KeyWrap, MAX_ARTIFACT_BYTES, MAX_PLAINTEXT_BYTES, SEALED_PREFIX_LEN,
+    artifact_key_from_prefix, decrypt_artifact, payload_wrap_key, seal_artifact,
+    unwrap_artifact_key, unwrap_secret, valid_segment, wrap_secret,
 };
 pub use replay::ConsumedSet;

@@ -596,6 +596,35 @@ struct SealArgs {
     build_id: Option<String>,
 }
 
+/// Read an artifact, refusing anything over `MAX_PLAINTEXT_BYTES` before loading it;
+/// the read is bounded too, in case the file grows after the size check.
+fn read_plaintext(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    let cap = keystone_core::MAX_PLAINTEXT_BYTES;
+    let too_big = |len: u64| {
+        anyhow::anyhow!(
+            "{} is {len} bytes; sealed artifacts hold at most {cap} bytes of plaintext",
+            path.display()
+        )
+    };
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if len > cap {
+        return Err(too_big(len));
+    }
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(len as usize));
+    file.take(cap + 1)
+        .read_to_end(&mut plaintext)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if plaintext.len() as u64 > cap {
+        return Err(too_big(plaintext.len() as u64));
+    }
+    Ok(plaintext)
+}
+
 /// `seal`: encrypt an artifact into `{dir}/{product}/{version}.bin` with
 /// `.sha256` (hex of the plaintext) and `.build` sidecars, under the
 /// secret and epoch the server reads.
@@ -632,13 +661,7 @@ fn cmd_seal(args: SealArgs) -> Result<()> {
     let paths = ArtifactPaths::new(&dir, &product, &version)?;
     let secret = read_payload_secret(&secret_path)?;
 
-    let plaintext =
-        Zeroizing::new(std::fs::read(&input).with_context(|| format!("reading {input}"))?);
-    ensure!(
-        plaintext.len() as u64 <= keystone_core::MAX_ARTIFACT_BYTES,
-        "{input} exceeds the {}-byte artifact cap",
-        keystone_core::MAX_ARTIFACT_BYTES
-    );
+    let plaintext = read_plaintext(Path::new(&input))?;
     let context = keystone_core::artifact_context(&product, &version, epoch);
     let sealed =
         keystone_core::seal_artifact(&secret, &context, &plaintext).context("sealing artifact")?;

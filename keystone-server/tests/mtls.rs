@@ -301,6 +301,41 @@ async fn customer_certificates_are_refused_on_the_admin_listener_without_charge(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_correct_logins_for_one_account_all_succeed() {
+    let limits = RateLimits {
+        exchange_per_ip: 100,
+        ..RateLimits::default()
+    };
+    assert!(limits.exchange_failures_per_account < 10);
+    let h = harness_with(TestSource::standard(), |b| {
+        b.require_client_certificates(true).rate_limits(limits)
+    })
+    .await;
+    let ca = make_ca();
+    let server = spawn_mtls(h.state.clone(), &ca, false);
+    let seat = https_client(&ca, Some(&client_cert(&ca, ACCOUNT)));
+    let logins: Vec<_> = (0..10)
+        .map(|_| {
+            let seat = seat.clone();
+            let addr = server.public;
+            tokio::spawn(async move {
+                https_post(
+                    &seat,
+                    addr,
+                    "/exchange",
+                    &exchange_req(ACCOUNT, SECRET, PRODUCT),
+                )
+                .await
+            })
+        })
+        .collect();
+    for login in logins {
+        let (status, value) = login.await.unwrap();
+        assert_eq!(status, 200, "{value}");
+    }
+}
+
 #[tokio::test]
 async fn another_customers_certificate_cannot_lock_out_an_account() {
     let limits = RateLimits {

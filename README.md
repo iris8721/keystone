@@ -142,14 +142,15 @@ Errors carry the server's `ErrorCode`. `ClientError::is_retryable` and `ErrorCod
 
 | Code | HTTP | Verdict |
 |---|---|---|
-| `stale_request`, `replay`, `rate_limited`, `artifact_not_found`, `backend_unavailable`, unrecognized codes | 401/409/429/404/503 | transient |
+| `stale_request`, `replay`, `rate_limited`, `artifact_not_found`, `backend_unavailable` | 401/409/429/404/503 | transient |
+| `unknown` and unrecognized codes | 500 | transient |
 | `invalid_mac` | 401 | dead (`Rejected`) |
 | `unknown_session` | 404 | dead (`UnknownSession`, e.g. server restart) |
 | `session_revoked`, `no_entitlement` | 403 | dead (`Revoked`) |
 | `session_expired`, `grace_exhausted` | 410 | dead |
 | `invalid_credentials`, `wrong_product`, `handoff_invalid`, `artifact_invalid`, `unsupported_protocol`, `bad_request`, `forbidden`, `active_signing_key`, `conflict` | 400/401/403/409/422/500 | request error, session untouched |
 
-A non-2xx response without a keystone error body is transient. Internal server errors carry `unknown` (500).
+A non-2xx response without a keystone error body is transient.
 
 ## Embedding the server
 

@@ -28,7 +28,7 @@ use crate::error::ClientError;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default cap on an artifact transfer, connect through last byte.
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Longest wait for the next bytes of any response body.
+/// Longest wait for the next bytes of a response body.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest JSON response body accepted.
 const MAX_JSON_BODY: u64 = 1024 * 1024;
@@ -74,6 +74,7 @@ pub(crate) struct TransportOptions {
     allow_insecure_http: bool,
     timeout: Duration,
     download_timeout: Duration,
+    read_idle: Duration,
 }
 
 impl TransportOptions {
@@ -86,6 +87,7 @@ impl TransportOptions {
             allow_insecure_http: false,
             timeout: DEFAULT_TIMEOUT,
             download_timeout: DEFAULT_DOWNLOAD_TIMEOUT,
+            read_idle: READ_IDLE_TIMEOUT,
         }
     }
 
@@ -111,6 +113,11 @@ impl TransportOptions {
 
     pub(crate) fn download_timeout(&mut self, timeout: Duration) {
         self.download_timeout = timeout;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_idle(&mut self, idle: Duration) {
+        self.read_idle = idle;
     }
 
     /// Validate the URL policy and build the HTTP client. `http://` needs
@@ -152,7 +159,6 @@ impl TransportOptions {
         );
         let mut builder = reqwest::Client::builder()
             .timeout(self.timeout)
-            .read_timeout(READ_IDLE_TIMEOUT)
             .default_headers(headers);
         if tls {
             builder = builder.use_preconfigured_tls(self.tls_config()?);
@@ -164,6 +170,7 @@ impl TransportOptions {
             http,
             base_url,
             download_timeout: self.download_timeout,
+            read_idle: self.read_idle,
         })
     }
 
@@ -287,28 +294,50 @@ impl ServerCertVerifier for PinnedVerifier {
 }
 
 /// A built HTTP client bound to one base URL; every request carries the
-/// protocol header. JSON calls use the short timeout, artifact transfers
-/// the download timeout; both give up after 30 s without new bytes.
+/// protocol header. JSON calls use the short total timeout, artifact
+/// transfers and uploads the download timeout. Response bodies also fail
+/// after `read_idle` without new bytes; request bodies have no idle limit.
 #[derive(Debug, Clone)]
 pub(crate) struct Transport {
     http: reqwest::Client,
     base_url: String,
     download_timeout: Duration,
+    read_idle: Duration,
+}
+
+/// A response whose body reads are bounded by the transport's idle timeout.
+pub(crate) struct Response {
+    inner: reqwest::Response,
+    read_idle: Duration,
+}
+
+impl Response {
+    pub(crate) fn status(&self) -> reqwest::StatusCode {
+        self.inner.status()
+    }
 }
 
 impl Transport {
+    fn response(&self, inner: reqwest::Response) -> Response {
+        Response {
+            inner,
+            read_idle: self.read_idle,
+        }
+    }
+
     /// POST a JSON body and return the raw response.
     pub(crate) async fn post<T: Serialize + ?Sized>(
         &self,
         path: &str,
         body: &T,
-    ) -> Result<reqwest::Response, ClientError> {
-        Ok(self
+    ) -> Result<Response, ClientError> {
+        let resp = self
             .http
             .post(format!("{}{path}", self.base_url))
             .json(body)
             .send()
-            .await?)
+            .await?;
+        Ok(self.response(resp))
     }
 
     /// GET an artifact with an `Authorization` header under the download
@@ -317,61 +346,67 @@ impl Transport {
         &self,
         path: &str,
         authorization: &str,
-    ) -> Result<reqwest::Response, ClientError> {
-        Ok(self
+    ) -> Result<Response, ClientError> {
+        let resp = self
             .http
             .get(format!("{}{path}", self.base_url))
             .header(reqwest::header::AUTHORIZATION, authorization)
             .timeout(self.download_timeout)
             .send()
-            .await?)
+            .await?;
+        Ok(self.response(resp))
     }
 
-    /// PUT a raw body with extra headers under the download timeout.
+    /// PUT a raw body with extra headers. Sending the body and waiting for
+    /// the response share only the download timeout, so a slow uplink or a
+    /// long server-side seal is not cut short by an idle limit.
     pub(crate) async fn upload(
         &self,
         path: &str,
         headers: HeaderMap,
         body: reqwest::Body,
-    ) -> Result<reqwest::Response, ClientError> {
-        Ok(self
+    ) -> Result<Response, ClientError> {
+        let resp = self
             .http
             .put(format!("{}{path}", self.base_url))
             .headers(headers)
             .body(body)
             .timeout(self.download_timeout)
             .send()
-            .await?)
+            .await?;
+        Ok(self.response(resp))
     }
 }
 
-/// Read a body, failing once it exceeds `cap` bytes.
-pub(crate) async fn read_capped(
-    mut resp: reqwest::Response,
-    cap: u64,
-) -> Result<Vec<u8>, ClientError> {
+/// Read a body, failing once it exceeds `cap` bytes or no bytes arrive for
+/// the idle timeout.
+pub(crate) async fn read_capped(mut resp: Response, cap: u64) -> Result<Vec<u8>, ClientError> {
     let too_large = || {
         ClientError::InvalidResponse(KeystoneError::Malformed(format!(
             "body exceeds {cap} bytes"
         )))
     };
-    if resp.content_length().is_some_and(|len| len > cap) {
+    if resp.inner.content_length().is_some_and(|len| len > cap) {
         return Err(too_large());
     }
+    let idle = resp.read_idle;
     let mut buf = Vec::new();
-    while let Some(chunk) = resp.chunk().await? {
+    loop {
+        let chunk = tokio::time::timeout(idle, resp.inner.chunk())
+            .await
+            .map_err(|_| ClientError::Stalled { idle })??;
+        let Some(chunk) = chunk else {
+            return Ok(buf);
+        };
         if buf.len() as u64 + chunk.len() as u64 > cap {
             return Err(too_large());
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf)
 }
 
 /// Read and parse a successful JSON body.
-pub(crate) async fn read_json<T: DeserializeOwned>(
-    resp: reqwest::Response,
-) -> Result<T, ClientError> {
+pub(crate) async fn read_json<T: DeserializeOwned>(resp: Response) -> Result<T, ClientError> {
     let bytes = read_capped(resp, MAX_JSON_BODY).await?;
     parse_json(&bytes, "response")
 }
@@ -383,9 +418,7 @@ pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8], what: &str) -> Resul
 }
 
 /// A 2xx response parsed as JSON; anything else as `ServerRejected`.
-pub(crate) async fn accept_json<T: DeserializeOwned>(
-    resp: reqwest::Response,
-) -> Result<T, ClientError> {
+pub(crate) async fn accept_json<T: DeserializeOwned>(resp: Response) -> Result<T, ClientError> {
     if resp.status().is_success() {
         read_json(resp).await
     } else {
@@ -395,7 +428,7 @@ pub(crate) async fn accept_json<T: DeserializeOwned>(
 
 /// Turn a non-2xx response into `ServerRejected`. A body that is not a
 /// keystone `ErrorBody` yields `code: None`.
-pub(crate) async fn rejection(resp: reqwest::Response) -> ClientError {
+pub(crate) async fn rejection(resp: Response) -> ClientError {
     let status = resp.status().as_u16();
     let body = read_capped(resp, MAX_ERROR_BODY)
         .await
@@ -412,5 +445,85 @@ pub(crate) async fn rejection(resp: reqwest::Response) -> ClientError {
             code: None,
             message: format!("HTTP {status} without a keystone error body"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::routing::put;
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    const IDLE: Duration = Duration::from_millis(200);
+
+    fn transport(addr: SocketAddr) -> Transport {
+        let mut options = TransportOptions::new(format!("http://{addr}"));
+        options.allow_insecure_http();
+        options.read_idle(IDLE);
+        options.download_timeout(Duration::from_secs(10));
+        options.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn slow_upload_and_slow_server_outlast_the_idle_window() {
+        async fn store(body: Bytes) -> axum::Json<Value> {
+            // Stands in for sealing: no response bytes for longer than IDLE.
+            tokio::time::sleep(IDLE * 2).await;
+            axum::Json(serde_json::json!({ "received": body.len() }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, Router::new().route("/up", put(store))).into_future());
+
+        let chunks = futures_util::stream::unfold(0u8, |sent| async move {
+            if sent == 5 {
+                return None;
+            }
+            tokio::time::sleep(IDLE * 3 / 4).await;
+            Some((Ok::<_, std::io::Error>(vec![sent; 100]), sent + 1))
+        });
+        let started = Instant::now();
+        let resp = transport(addr)
+            .upload("/up", HeaderMap::new(), reqwest::Body::wrap_stream(chunks))
+            .await
+            .expect("upload is not cut off by the idle window");
+        let body: Value = accept_json(resp).await.unwrap();
+        assert_eq!(body["received"], 500);
+        assert!(started.elapsed() > IDLE * 4);
+    }
+
+    #[tokio::test]
+    async fn stalled_response_body_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{\"a\"",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let resp = transport(addr).post("/json", &()).await.unwrap();
+        let started = Instant::now();
+        let err = read_json::<Value>(resp).await.unwrap_err();
+        assert!(
+            matches!(err, ClientError::Stalled { idle } if idle == IDLE),
+            "{err:?}"
+        );
+        assert!(err.is_retryable());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

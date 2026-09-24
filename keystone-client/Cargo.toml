@@ -30,6 +30,7 @@ zeroize = "1"
 async-trait = "0.1"
 axum = "0.7"
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+futures-util = "0.3"
 keystone-server = { path = "../keystone-server", default-features = false }
 parking_lot = "0.12"
 rcgen = "0.13"

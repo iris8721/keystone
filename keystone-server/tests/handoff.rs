@@ -241,6 +241,46 @@ async fn attest_on_a_lapsed_parent_lease_expires_the_parent() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_attests_over_the_bucket_keep_their_handoffs() {
+    let limits = RateLimits {
+        attest_per_session: 2,
+        window: std::time::Duration::from_secs(1),
+        ..RateLimits::default()
+    };
+    let h = harness_with(TestSource::standard(), |b| b.rate_limits(limits)).await;
+    let parent = exchange(&h).await;
+    let mut handoffs = Vec::new();
+    for _ in 0..4 {
+        handoffs.push(handoff_ok(&h.app, &h.issuers, &parent).await);
+    }
+    let tasks: Vec<_> = handoffs
+        .iter()
+        .map(|handoff| {
+            let app = h.app.clone();
+            let req = attest_req(&parent.id, handoff, PROCESS_ID);
+            tokio::spawn(async move { post(&app, "/attest", &req).await })
+        })
+        .collect();
+    let mut limited = Vec::new();
+    for (task, handoff) in tasks.into_iter().zip(&handoffs) {
+        let (status, body) = task.await.unwrap();
+        match status {
+            StatusCode::OK => {}
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert_eq!(code(&body), ErrorCode::RateLimited);
+                limited.push(handoff);
+            }
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert_eq!(limited.len(), 2);
+    tokio::time::sleep(limits.window + std::time::Duration::from_millis(100)).await;
+    for handoff in limited {
+        attest_ok(&h.app, &h.issuers, &parent.id, handoff).await;
+    }
+}
+
 #[tokio::test]
 async fn full_parent_bucket_leaves_the_handoff_redeemable() {
     let limits = RateLimits {

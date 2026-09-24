@@ -8,6 +8,7 @@ use keystone_core::wire::{
     ADMIN_TOKEN_HEADER, BUILD_ID_HEADER, MAX_ADMIN_TOKEN_BYTES, PublishBody, RevokeBody,
     RevokeRequest, RevokeTarget, paths, validate_build_id, validate_release,
 };
+use keystone_core::{KeystoneError, MAX_PLAINTEXT_BYTES};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -67,7 +68,9 @@ impl AdminClientBuilder {
         self
     }
 
-    /// Cap on an artifact upload, connect through response; default 10 min.
+    /// Total cap on an artifact upload, connect through response; default
+    /// 10 min. Uploads have no idle limit, so a slow uplink or a long seal
+    /// on the server only has to finish within this cap.
     pub fn download_timeout(mut self, timeout: Duration) -> Self {
         self.options.download_timeout(timeout);
         self
@@ -156,8 +159,10 @@ impl AdminClient {
 
     /// Publish plaintext `body` as release `product`/`version` with
     /// `build_id`; the server seals and stores it. Releases are immutable:
-    /// an existing version is rejected. Names are validated before sending
-    /// (`Core`); the upload runs under the download timeout.
+    /// an existing version is rejected. Names are validated, and a buffered
+    /// body over `MAX_PLAINTEXT_BYTES` is refused (`FieldTooLong("plaintext")`),
+    /// before sending (`Core`); an oversized streamed body is refused by the
+    /// server with 413. The upload runs under the download timeout.
     pub async fn publish_artifact(
         &self,
         product: &str,
@@ -165,6 +170,13 @@ impl AdminClient {
         build_id: &str,
         body: impl Into<reqwest::Body>,
     ) -> Result<PublishBody, ClientError> {
+        let body = body.into();
+        if body
+            .as_bytes()
+            .is_some_and(|bytes| bytes.len() as u64 > MAX_PLAINTEXT_BYTES)
+        {
+            return Err(KeystoneError::FieldTooLong("plaintext").into());
+        }
         validate_release(product, version)?;
         validate_build_id(build_id)?;
         let mut headers = HeaderMap::new();
@@ -175,10 +187,10 @@ impl AdminClient {
         headers.insert(
             HeaderName::from_static(BUILD_ID_HEADER),
             HeaderValue::from_str(build_id)
-                .map_err(|_| keystone_core::KeystoneError::Malformed("build id".into()))?,
+                .map_err(|_| KeystoneError::Malformed("build id".into()))?,
         );
         let path = paths::artifact(product, version);
-        accept_json(self.transport.upload(&path, headers, body.into()).await?).await
+        accept_json(self.transport.upload(&path, headers, body).await?).await
     }
 }
 
@@ -195,5 +207,28 @@ mod tests {
         assert!(!format!("{builder:?}").contains(token));
         let client = builder.build().unwrap();
         assert!(!format!("{client:?}").contains(token));
+    }
+
+    #[tokio::test]
+    async fn oversized_buffered_publish_is_refused_before_sending() {
+        // Nothing listens on port 1: reaching the network would be a transport error.
+        let client = AdminClient::builder("http://127.0.0.1:1")
+            .allow_insecure_http()
+            .admin_token("correct-horse-battery-staple-0123456789")
+            .build()
+            .unwrap();
+        // Zeroed allocations are lazily committed, so this stays cheap.
+        let oversized = vec![0u8; MAX_PLAINTEXT_BYTES as usize + 1];
+        let err = client
+            .publish_artifact("app", "1.0.0", "b1", oversized)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::Core(KeystoneError::FieldTooLong("plaintext"))
+            ),
+            "{err:?}"
+        );
     }
 }

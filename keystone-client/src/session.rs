@@ -48,6 +48,34 @@ impl SessionClock {
         }
     }
 
+    /// The clock implied by a signed `server_time` for a request sent at
+    /// `sent`: anchored now at `server_time + rtt/2`, so a delayed response
+    /// moves the clock back by at most half the round trip. A body that may
+    /// already be dead (`server_time + rtt >= valid_until`) is `Expired`.
+    pub(crate) fn from_response(
+        server_time: DateTime<Utc>,
+        sent: Instant,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, ClientError> {
+        Self::received_at(server_time, sent, Instant::now(), valid_until)
+    }
+
+    fn received_at(
+        server_time: DateTime<Utc>,
+        sent: Instant,
+        received: Instant,
+        valid_until: DateTime<Utc>,
+    ) -> Result<Self, ClientError> {
+        let expired = || ClientError::InvalidResponse(KeystoneError::Expired);
+        let rtt =
+            Duration::from_std(received.saturating_duration_since(sent)).map_err(|_| expired())?;
+        let latest = server_time.checked_add_signed(rtt).ok_or_else(expired)?;
+        if latest >= valid_until {
+            return Err(expired());
+        }
+        Ok(Self::anchored(received, server_time + rtt / 2))
+    }
+
     /// Current server-aligned time.
     pub(crate) fn now(&self) -> DateTime<Utc> {
         self.at(Instant::now())
@@ -364,13 +392,13 @@ impl ClientSession {
     }
 
     /// Install a verified lease body: refresh the lease, features, and clock
-    /// anchor and clear any retry. A grace window that lapsed while the
-    /// request was in flight is not revived.
+    /// (from [`SessionClock::from_response`]) and clear any retry. A grace
+    /// window that lapsed while the request was in flight is not revived.
     pub(crate) fn install_lease(
         &self,
         lease: Lease,
         features: Vec<FeatureGrant>,
-        server_time: DateTime<Utc>,
+        clock: SessionClock,
     ) {
         let mut state = self.inner.write();
         let now = state.clock.now();
@@ -390,13 +418,13 @@ impl ClientSession {
         state.capped = previous_expiry.is_some_and(|previous| expires_at <= previous);
         state.lease_len = state.lease_len.max(len);
         state.features = features;
-        state.clock = SessionClock::starting_at(server_time);
+        state.clock = clock;
         state.retry = None;
     }
 
-    /// Re-anchor the clock on a signed server time outside a lease body.
-    pub(crate) fn observe_server_time(&self, server_time: DateTime<Utc>) {
-        self.inner.write().clock = SessionClock::starting_at(server_time);
+    /// Re-anchor the clock on a signed body outside a lease renewal.
+    pub(crate) fn set_clock(&self, clock: SessionClock) {
+        self.inner.write().clock = clock;
     }
 
     /// A heartbeat failed: kills end the session, transient failures start
@@ -767,7 +795,11 @@ mod tests {
         // Near the grant's end a renewal extends the lease to only 12 s:
         // 80% is 9.6 s, below the floor of a tenth of the 100 s lease.
         let granted = now + Duration::seconds(95);
-        session.install_lease(lease_at(granted, 12, 60), Vec::new(), granted);
+        session.install_lease(
+            lease_at(granted, 12, 60),
+            Vec::new(),
+            SessionClock::starting_at(granted),
+        );
         assert_eq!(
             session.next_heartbeat_due(),
             Some(instant_of(&session, granted + Duration::seconds(10)))
@@ -781,10 +813,46 @@ mod tests {
             expires_at: granted + Duration::seconds(12),
             grace_period: Duration::seconds(60),
         };
-        session.install_lease(same_end, Vec::new(), renewed);
+        session.install_lease(same_end, Vec::new(), SessionClock::starting_at(renewed));
         assert_eq!(
             session.next_heartbeat_due(),
             Some(instant_of(&session, granted + Duration::seconds(12)))
+        );
+    }
+
+    #[test]
+    fn response_older_than_the_lease_remainder_is_rejected() {
+        let sent = Instant::now();
+        let received = sent + StdDuration::from_secs(40);
+        let server_time = Utc::now();
+        let lease_end = server_time + Duration::seconds(30);
+        assert!(matches!(
+            SessionClock::received_at(server_time, sent, received, lease_end),
+            Err(ClientError::InvalidResponse(KeystoneError::Expired))
+        ));
+        let quick = sent + StdDuration::from_secs(2);
+        assert!(SessionClock::received_at(server_time, sent, quick, lease_end).is_ok());
+    }
+
+    #[test]
+    fn delayed_response_moves_the_clock_back_by_at_most_half_the_round_trip() {
+        let clock = SessionClock::starting_at(Utc::now());
+        let sent = Instant::now();
+        let received = sent + StdDuration::from_secs(20);
+        let before = clock.at(received);
+        // Worst case: the server stamped the body the moment the request left.
+        let server_time = clock.at(sent);
+        let reanchored = SessionClock::received_at(
+            server_time,
+            sent,
+            received,
+            server_time + Duration::seconds(300),
+        )
+        .unwrap();
+        assert_eq!(before - reanchored.at(received), Duration::seconds(10));
+        assert_eq!(
+            reanchored.at(received + StdDuration::from_secs(5)),
+            server_time + Duration::seconds(15)
         );
     }
 }

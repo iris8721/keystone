@@ -70,7 +70,7 @@ impl ClientBuilder {
     }
 
     /// Cap on the artifact download, connect through last byte; default
-    /// 10 min. Any transfer also fails after 30 s without new bytes.
+    /// 10 min. Every response body also fails after 30 s without new bytes.
     pub fn download_timeout(mut self, timeout: StdDuration) -> Self {
         self.options.download_timeout(timeout);
         self
@@ -261,8 +261,10 @@ impl KeystoneClient {
             },
         )?;
         let body: HandoffBody = parse_json(&env.body, "handoff body")?;
+        let clock =
+            SessionClock::from_response(body.server_time, challenge.minted, body.expires_at)?;
         session.consume(challenge.nonce, env.expires_at)?;
-        session.observe_server_time(body.server_time);
+        session.set_clock(clock);
         self.apply_revocations(&body.revoked_key_ids);
 
         let token_ttl = request.ttl().min(body.expires_at - session.now());
@@ -326,13 +328,15 @@ impl KeystoneClient {
             &body.session_key_wrap,
         )
         .map_err(ClientError::InvalidResponse)?;
+        let clock =
+            SessionClock::from_response(body.server_time, challenge.minted, body.lease.expires_at)?;
         let session = ClientSession::new(
             body.session_id,
             handoff.product.clone(),
             key,
             body.lease,
             body.features,
-            SessionClock::starting_at(body.server_time),
+            clock,
         );
         session.consume(challenge.nonce, env.expires_at)?;
         self.apply_revocations(&body.revoked_key_ids);
@@ -375,9 +379,11 @@ impl KeystoneClient {
             },
         )?;
         let body: LeaseBody = parse_json(&env.body, "heartbeat body")?;
+        let clock =
+            SessionClock::from_response(body.server_time, challenge.minted, body.lease.expires_at)?;
         session.consume(challenge.nonce, env.expires_at)?;
         self.apply_revocations(&body.revoked_key_ids);
-        session.install_lease(body.lease, body.features, body.server_time);
+        session.install_lease(body.lease, body.features, clock);
         session.authorize()
     }
 
@@ -457,8 +463,10 @@ impl KeystoneClient {
             }
         }
         let key = session.unwrap_artifact_key(&challenge.nonce, &body.payload_key_wrap)?;
+        let clock =
+            SessionClock::from_response(body.server_time, challenge.minted, env.expires_at)?;
         session.consume(challenge.nonce, env.expires_at)?;
-        session.observe_server_time(body.server_time);
+        session.set_clock(clock);
         self.apply_revocations(&body.revoked_key_ids);
         Ok((body.manifest, key))
     }
@@ -565,7 +573,9 @@ fn settle<T>(session: &ClientSession, result: Result<T, ClientError>) -> Result<
 fn failure_verdict(error: &ClientError) -> Verdict {
     match error {
         ClientError::ServerRejected { code, .. } => session_verdict(*code),
-        ClientError::Transport(_) | ClientError::InvalidResponse(_) => Verdict::Transient,
+        ClientError::Transport(_)
+        | ClientError::Stalled { .. }
+        | ClientError::InvalidResponse(_) => Verdict::Transient,
         ClientError::Core(_)
         | ClientError::NotAuthenticated
         | ClientError::InvalidConfig { .. } => Verdict::RequestError,

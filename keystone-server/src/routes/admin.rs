@@ -15,7 +15,7 @@ use keystone_core::wire::{
     ADMIN_TOKEN_HEADER, BUILD_ID_HEADER, ErrorCode, PublishBody, RevokeBody, RevokeRequest,
     RevokeTarget, validate_build_id, validate_release,
 };
-use keystone_core::{ArtifactPaths, MAX_ARTIFACT_BYTES, artifact_context, fs, seal_artifact};
+use keystone_core::{ArtifactPaths, MAX_PLAINTEXT_BYTES, artifact_context, fs, seal_artifact};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -44,10 +44,11 @@ pub(crate) async fn revoke(
 }
 
 /// Seal and store a new release. Releases are immutable: an existing
-/// version is 409. The plaintext is streamed to an owner-only staging file
-/// while hashing, sealed off the executor under the current epoch, and the
-/// sidecars are written before the sealed blob, so readers never see a blob
-/// without them.
+/// version is 409 `conflict`. The plaintext is streamed to an owner-only
+/// staging file while hashing; sealing, the writes, and the audit record run
+/// in a detached task that holds the publish lock, so a dropped request still
+/// completes (or cleanly abandons) its release and never lets a second
+/// publish of the same version interleave.
 pub(crate) async fn publish(
     State(state): State<AppState>,
     peer: Peer,
@@ -68,14 +69,14 @@ pub(crate) async fn publish(
         .ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "missing build id header"))?
         .to_string();
     validate_build_id(&build_id).map_err(ApiError::bad_request)?;
-    let payloads = state.inner.payloads.as_ref().ok_or_else(|| {
+    let payloads = state.inner.payloads.clone().ok_or_else(|| {
         ApiError::new(ErrorCode::BackendUnavailable, "payloads are not configured")
     })?;
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|len| len > MAX_ARTIFACT_BYTES) {
+    if declared.is_some_and(|len| len > MAX_PLAINTEXT_BYTES) {
         return Err(too_large());
     }
 
@@ -86,40 +87,60 @@ pub(crate) async fn publish(
         .parent()
         .map(FsPath::to_path_buf)
         .ok_or_else(|| ApiError::internal("artifact path has no parent"))?;
-    let _serial = state.inner.publish.lock().await;
+    let serial = state.inner.publish.clone().lock_owned().await;
     if tokio::fs::try_exists(&paths.sealed)
         .await
         .map_err(ApiError::internal)?
     {
-        return Err(ApiError::new(ErrorCode::Conflict, "release already exists"));
+        return Err(conflict());
     }
     tokio::fs::create_dir_all(&product_dir)
         .await
         .map_err(ApiError::internal)?;
 
-    let staging =
-        Staging(product_dir.join(format!(".{version}.{}.upload", Uuid::new_v4().simple())));
-    let sha256 = receive(body, &staging.0).await?;
-    let sha_hex = hex::encode(sha256);
-    seal_release(
-        payloads, &product, &version, &build_id, &sha_hex, &staging.0, paths,
-    )
-    .await?;
-
-    state.audit(AuditEvent::ArtifactPublished {
-        product: product.clone(),
-        version: version.clone(),
-        build_id: build_id.clone(),
-    });
-    Ok(Json(PublishBody {
+    let staging = |suffix: &str| {
+        Staging(product_dir.join(format!(".{version}.{}.{suffix}", Uuid::new_v4().simple())))
+    };
+    let upload = staging("upload");
+    let sealed_staging = staging("sealed");
+    let sha256 = receive(body, &upload.0).await?;
+    let release = Release {
         product,
         version,
-        sha256: sha_hex,
         build_id,
+        sha_hex: hex::encode(sha256),
+    };
+
+    let task = tokio::spawn(async move {
+        let _serial = serial;
+        let stored = seal_release(&payloads, &release, upload, sealed_staging, paths).await;
+        if stored.is_ok() {
+            state.audit(AuditEvent::ArtifactPublished {
+                product: release.product.clone(),
+                version: release.version.clone(),
+                build_id: release.build_id.clone(),
+            });
+        }
+        stored.map(|()| release)
+    });
+    let release = task.await.map_err(ApiError::internal)??;
+    Ok(Json(PublishBody {
+        product: release.product,
+        version: release.version,
+        sha256: release.sha_hex,
+        build_id: release.build_id,
     }))
 }
 
-/// Removes the staging file however the request ends.
+/// What a publish stores.
+struct Release {
+    product: String,
+    version: String,
+    build_id: String,
+    sha_hex: String,
+}
+
+/// Removes a staging file however the request ends.
 struct Staging(PathBuf);
 
 impl Drop for Staging {
@@ -133,8 +154,12 @@ fn too_large() -> ApiError {
         .with_status(StatusCode::PAYLOAD_TOO_LARGE)
 }
 
+fn conflict() -> ApiError {
+    ApiError::new(ErrorCode::Conflict, "release already exists")
+}
+
 /// Stream the request body into `path` (owner-only), returning the sha256 of
-/// what was written; more than `MAX_ARTIFACT_BYTES` is 413.
+/// what was written; more than `MAX_PLAINTEXT_BYTES` is 413.
 async fn receive(mut body: Body, path: &FsPath) -> Result<[u8; 32], ApiError> {
     let target = path.to_path_buf();
     let file = tokio::task::spawn_blocking(move || fs::open_append_owner_only(&target))
@@ -151,7 +176,7 @@ async fn receive(mut body: Body, path: &FsPath) -> Result<[u8; 32], ApiError> {
             continue;
         };
         received += chunk.len() as u64;
-        if received > MAX_ARTIFACT_BYTES {
+        if received > MAX_PLAINTEXT_BYTES {
             return Err(too_large());
         }
         hasher.update(&chunk);
@@ -161,32 +186,41 @@ async fn receive(mut body: Body, path: &FsPath) -> Result<[u8; 32], ApiError> {
     Ok(hasher.finalize().into())
 }
 
-/// Seal the staged plaintext and write `.sha256`, `.build`, then the blob.
+/// Seal the staged plaintext, then write `.sha256`, `.build`, and finally
+/// link the blob into place. Sidecars are written only while no blob
+/// exists, and the link never replaces one, so an existing release is never
+/// altered.
 async fn seal_release(
     payloads: &PayloadConfig,
-    product: &str,
-    version: &str,
-    build_id: &str,
-    sha_hex: &str,
-    staged: &FsPath,
+    release: &Release,
+    upload: Staging,
+    sealed_staging: Staging,
     paths: ArtifactPaths,
 ) -> Result<(), ApiError> {
     let secret = payloads.secret.clone();
-    let context = artifact_context(product, version, payloads.epoch);
-    let staged = staged.to_path_buf();
-    let sha_hex = sha_hex.to_string();
-    let build_id = build_id.to_string();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let plaintext = Zeroizing::new(std::fs::read(&staged)?);
+    let context = artifact_context(&release.product, &release.version, payloads.epoch);
+    let sha_hex = release.sha_hex.clone();
+    let build_id = release.build_id.clone();
+    let placed = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        let plaintext = Zeroizing::new(std::fs::read(&upload.0)?);
         let sealed = seal_artifact(&secret, &context, &plaintext)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        fs::write_owner_only_atomic(&sealed_staging.0, &sealed)?;
+        if paths.sealed.try_exists()? {
+            return Ok(false);
+        }
         fs::write_owner_only_atomic(&paths.sha256, sha_hex.as_bytes())?;
         fs::write_owner_only_atomic(&paths.build, build_id.as_bytes())?;
-        fs::write_owner_only_atomic(&paths.sealed, &sealed)
+        match std::fs::hard_link(&sealed_staging.0, &paths.sealed) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
     })
     .await
     .map_err(ApiError::internal)?
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+    if placed { Ok(()) } else { Err(conflict()) }
 }
 
 /// When an allow-list is configured, the leaf certificate must be on it.

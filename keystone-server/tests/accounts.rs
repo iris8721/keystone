@@ -1,6 +1,7 @@
 //! LocalAccounts: the file-backed entitlement source.
 
 use std::path::{Path, PathBuf};
+use std::task::Poll;
 use std::time::{Duration as StdDuration, Instant};
 
 use argon2::Argon2;
@@ -121,6 +122,34 @@ async fn missing_or_malformed_file_is_a_backend_error() {
     std::fs::write(&path, b"{not json").unwrap();
     let malformed = LocalAccounts::open(path);
     assert!(malformed.authenticate(ACCOUNT, SECRET).await.is_err());
+}
+
+#[tokio::test]
+async fn a_cancelled_refresh_does_not_freeze_reloads() {
+    let dir = workdir();
+    let path = write(&dir, vec![]);
+    let backend = LocalAccounts::open(path.clone());
+    tokio::time::sleep(StdDuration::from_millis(1100)).await;
+
+    // Start the once-per-second refresh, then drop the caller mid-way.
+    let mut call = Box::pin(backend.entitlement(ACCOUNT, PRODUCT));
+    let pending = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx).is_pending())).await;
+    assert!(pending, "the refresh finished before it could be cancelled");
+    drop(call);
+
+    tokio::time::sleep(StdDuration::from_millis(1100)).await;
+    write(
+        &dir,
+        vec![record(ACCOUNT, SECRET, vec![grant(PRODUCT, 30, &["all"])])],
+    );
+    tokio::time::sleep(StdDuration::from_millis(1100)).await;
+    assert!(
+        backend
+            .authenticate(ACCOUNT, SECRET)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

@@ -55,9 +55,9 @@ pub(crate) async fn exchange(
         return Err(denied(&state, &req.account, ErrorCode::InvalidCredentials));
     }
 
-    let reservations = reserve_failure_slots(&state, &peer, &req.account).await;
-    let Some(reservations) = reservations else {
-        return Err(denied(&state, &req.account, ErrorCode::RateLimited));
+    let attempt = match Attempt::begin(&state, &peer, &req.account).await {
+        Ok(attempt) => attempt,
+        Err(reason) => return Err(denied(&state, &req.account, reason)),
     };
     let authenticated = state
         .inner
@@ -67,14 +67,15 @@ pub(crate) async fn exchange(
     let authenticated = match authenticated {
         Ok(identity) => identity.is_some(),
         Err(e) => {
-            refund(&state, &reservations).await;
+            attempt.release(&state).await;
             return Err(ApiError::backend(e));
         }
     };
     if !authenticated {
+        attempt.fail(&state).await;
         return Err(denied(&state, &req.account, ErrorCode::InvalidCredentials));
     }
-    refund(&state, &reservations).await;
+    attempt.release(&state).await;
 
     let now = now_ms();
     let grant = state
@@ -171,9 +172,18 @@ fn denied(state: &AppState, account: &str, reason: ErrorCode) -> ApiError {
     ApiError::new(reason, message)
 }
 
-/// Failure buckets a login attempt reserves before the password check:
-/// per account under mTLS (only certificates naming the account get here),
-/// otherwise per (account, client /64) plus an account-wide ceiling.
+/// How long a login waits for other in-flight attempts on the same account
+/// to finish before it is refused.
+const ATTEMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Pause between admission retries while other attempts are in flight.
+const ATTEMPT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+/// In-flight attempts one account may have queued, as a multiple of its
+/// failure limit.
+const IN_FLIGHT_FACTOR: u32 = 4;
+
+/// Failure buckets for a login: per account under mTLS (only certificates
+/// naming the account get here), otherwise per (account, client /64) plus an
+/// account-wide ceiling.
 fn failure_buckets(peer: &Peer, account: &str, limits: &RateLimits) -> Vec<(String, u32)> {
     let account_key = format!("exchange:failures:{}:{account}", account.len());
     if peer.certs.is_some() {
@@ -191,30 +201,100 @@ fn failure_buckets(peer: &Peer, account: &str, limits: &RateLimits) -> Vec<(Stri
     ]
 }
 
-/// Reserve one slot in every failure bucket, or none: `None` when any
-/// bucket is full. Reserving before the check bounds concurrent guesses.
-async fn reserve_failure_slots(
-    state: &AppState,
-    peer: &Peer,
-    account: &str,
-) -> Option<Vec<String>> {
-    let limiter = &state.inner.limiter;
-    let mut reserved = Vec::new();
-    for (key, per_window) in failure_buckets(peer, account, &state.inner.rate_limits) {
-        if !limiter
-            .check(&key, per_window, state.inner.rate_limits.window)
-            .await
-        {
-            refund(state, &reserved).await;
-            return None;
-        }
-        reserved.push(key);
-    }
-    Some(reserved)
+/// One password check's claim on the account's limits.
+///
+/// Each failure bucket has two counters: `slots` holds committed failures
+/// plus evaluations in flight, and `committed` holds failures only. An
+/// evaluation starts only with a free slot in every bucket, so failures can
+/// never exceed the limit even when guesses are concurrent. When the slots
+/// are taken by in-flight attempts rather than failures, the attempt waits
+/// instead of being refused, so simultaneous correct logins all succeed.
+struct Attempt {
+    in_flight: String,
+    buckets: Vec<(String, u32)>,
 }
 
-async fn refund(state: &AppState, keys: &[String]) {
-    for key in keys {
-        state.inner.limiter.refund(key).await;
+impl Attempt {
+    async fn begin(state: &AppState, peer: &Peer, account: &str) -> Result<Self, ErrorCode> {
+        let limits = state.inner.rate_limits;
+        let limiter = &state.inner.limiter;
+        let in_flight = format!("exchange:inflight:{}:{account}", account.len());
+        let queue = limits
+            .exchange_failures_per_account
+            .saturating_mul(IN_FLIGHT_FACTOR);
+        if !limiter.check(&in_flight, queue, limits.window).await {
+            return Err(ErrorCode::RateLimited);
+        }
+        let attempt = Self {
+            in_flight,
+            buckets: failure_buckets(peer, account, &limits),
+        };
+        let deadline = tokio::time::Instant::now() + ATTEMPT_WAIT;
+        loop {
+            if attempt.reserve_slots(state).await {
+                return Ok(attempt);
+            }
+            if attempt.failures_exhausted(state).await || tokio::time::Instant::now() >= deadline {
+                limiter.refund(&attempt.in_flight).await;
+                return Err(ErrorCode::RateLimited);
+            }
+            tokio::time::sleep(ATTEMPT_RETRY).await;
+        }
     }
+
+    /// Take one slot in every bucket, or none.
+    async fn reserve_slots(&self, state: &AppState) -> bool {
+        let limiter = &state.inner.limiter;
+        let window = state.inner.rate_limits.window;
+        for (taken, (key, per_window)) in self.buckets.iter().enumerate() {
+            if !limiter.check(key, *per_window, window).await {
+                for (key, _) in &self.buckets[..taken] {
+                    limiter.refund(key).await;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether some bucket is full of committed failures, not in-flight work.
+    async fn failures_exhausted(&self, state: &AppState) -> bool {
+        let window = state.inner.rate_limits.window;
+        for (key, per_window) in &self.buckets {
+            if !state
+                .inner
+                .limiter
+                .peek(&committed(key), *per_window, window)
+                .await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The check failed: its slots stay taken and count as failures.
+    async fn fail(self, state: &AppState) {
+        let window = state.inner.rate_limits.window;
+        for (key, per_window) in &self.buckets {
+            state
+                .inner
+                .limiter
+                .check(&committed(key), *per_window, window)
+                .await;
+        }
+        state.inner.limiter.refund(&self.in_flight).await;
+    }
+
+    /// The check succeeded or never ran: give every slot back.
+    async fn release(self, state: &AppState) {
+        for (key, _) in &self.buckets {
+            state.inner.limiter.refund(key).await;
+        }
+        state.inner.limiter.refund(&self.in_flight).await;
+    }
+}
+
+fn committed(key: &str) -> String {
+    format!("{key}:committed")
 }

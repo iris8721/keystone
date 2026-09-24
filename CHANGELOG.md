@@ -27,9 +27,9 @@ Wire protocol 2. Not compatible with 0.1 clients, servers, key files or artifact
 - `keystone_core::wire`: request/response types, `ErrorCode` (incl. `conflict`), `Verdict`, MAC contexts, paths, `DownloadAuthorization`, protocol header.
 - `keystone_core::{fs, revocations}`: owner-only atomic writes, revocation file format.
 - `POST /handoff`, `HandoffToken` (stdin transport), `PendingSession`, child sessions.
-- Artifact publishing: admin `PUT /artifacts/{product}/{version}`, `AdminClient::publish_artifact`.
-- `SessionGate`, `ClientSession::features`, `KeystoneClient::run_keepalive`, `AdminClient`, `ClientError::is_retryable`.
-- `ClientBuilder` with multiple SPKI pins and a separate `download_timeout`.
+- Artifact publishing: admin `PUT /artifacts/{product}/{version}`, `AdminClient::publish_artifact`; `payload::MAX_PLAINTEXT_BYTES`.
+- `SessionGate`, `ClientSession::features`, `KeystoneClient::run_keepalive`, `AdminClient`, `ClientError::{is_retryable, Stalled}`.
+- `ClientBuilder` with multiple SPKI pins, a separate `download_timeout`, and an idle timeout on response bodies.
 - `TrustedIssuers::from_public_keys`; `VerifyingKey` re-exported.
 - Server storage traits: `SessionStore`, `RateLimiter`, `RevocationStore`, `AuditSink`; `AppState::builder`; `ServerConfig::into_parts`; `serve` with graceful shutdown; `ServerError`.
 - Configurable lease, grace and rate limits (`KEYSTONE_LEASE_TTL_SECS`, `KEYSTONE_GRACE_SECS`, `KEYSTONE_RATE_*`).

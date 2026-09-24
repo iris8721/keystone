@@ -124,3 +124,33 @@ fn seal_rejects_path_traversal_in_product() {
     let escaped: PathBuf = root.join("escape");
     assert!(!escaped.exists(), "wrote outside the payload dir");
 }
+
+/// An input one byte over the plaintext cap is refused from its size alone.
+#[test]
+fn seal_rejects_input_over_the_plaintext_cap() {
+    let root = workdir("seal");
+    let input = root.join("huge.bin");
+    // set_len extends without writing data, so this stays cheap.
+    std::fs::File::create(&input)
+        .unwrap()
+        .set_len(keystone_core::MAX_PLAINTEXT_BYTES + 1)
+        .unwrap();
+    let secret = root.join("payload.secret");
+    std::fs::write(&secret, SECRET).unwrap();
+    let out = xtask(&root)
+        .args(["seal", "--product", "prod", "--version", "1.0.0", "--in"])
+        .arg(&input)
+        .arg("--out")
+        .arg(root.join("out"))
+        .env("KEYSTONE_PAYLOAD_SECRET_FILE", &secret)
+        .output()
+        .unwrap();
+    std::fs::remove_file(&input).unwrap();
+    assert!(!out.status.success(), "oversized input must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&keystone_core::MAX_PLAINTEXT_BYTES.to_string()),
+        "error must name the cap: {stderr}"
+    );
+    assert!(!paths(&root).sealed.exists());
+}

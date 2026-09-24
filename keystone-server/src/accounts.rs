@@ -43,11 +43,14 @@ impl SecretVerifier {
         stored: Option<String>,
         secret: &str,
     ) -> Result<bool, BackendError> {
-        let _permit = self.permits.clone().acquire_owned().await?;
+        // The permit moves into the blocking task, so it is held for as long
+        // as the hash runs even if the request is dropped.
+        let permit = self.permits.clone().acquire_owned().await?;
         let known = stored.is_some();
         let hash = stored.unwrap_or_else(|| self.dummy_hash.to_string());
         let secret = Zeroizing::new(secret.to_owned());
         let matched = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let parsed = PasswordHash::new(&hash)
                 .map_err(|e| BackendError::from(format!("stored hash corrupt: {e}")))?;
             Ok::<_, BackendError>(
@@ -88,8 +91,8 @@ struct Snapshot {
 pub struct LocalAccounts {
     path: Arc<Path>,
     verifier: SecretVerifier,
-    snapshot: ArcSwap<Snapshot>,
-    refreshing: AtomicBool,
+    snapshot: Arc<ArcSwap<Snapshot>>,
+    refreshing: Arc<AtomicBool>,
 }
 
 impl LocalAccounts {
@@ -103,8 +106,8 @@ impl LocalAccounts {
         Self {
             path: path.into(),
             verifier: SecretVerifier::new(),
-            snapshot: ArcSwap::from_pointee(snapshot),
-            refreshing: AtomicBool::new(false),
+            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -117,12 +120,22 @@ impl LocalAccounts {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
+            // The reload runs in its own task: dropping this caller cannot
+            // leave the flag set or skip publishing the result.
             let path = self.path.clone();
-            let previous = snapshot.clone();
-            let refreshed = tokio::task::spawn_blocking(move || refresh(&path, &previous)).await;
-            self.refreshing.store(false, Ordering::Release);
-            snapshot = Arc::new(refreshed?);
-            self.snapshot.store(snapshot.clone());
+            let published = self.snapshot.clone();
+            let refreshing = self.refreshing.clone();
+            let task = tokio::spawn(async move {
+                let previous = published.load_full();
+                let reloaded = tokio::task::spawn_blocking(move || refresh(&path, &previous)).await;
+                match reloaded {
+                    Ok(next) => published.store(Arc::new(next)),
+                    Err(e) => tracing::error!("accounts reload failed: {e}"),
+                }
+                refreshing.store(false, Ordering::Release);
+            });
+            let _ = task.await;
+            snapshot = self.snapshot.load_full();
         }
         snapshot
             .loaded
