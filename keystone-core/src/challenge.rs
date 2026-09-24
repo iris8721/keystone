@@ -1,40 +1,42 @@
-use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+//! Requester-minted challenges that make a captured response worthless
+//! in any later exchange.
 
-/// A fresh nonce the verifier issues before an authorization exchange.
-/// The response must echo it — this is what makes a captured response
-/// worthless in a new session.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+use std::time::{Duration, Instant};
+
+/// A fresh nonce the requester sends and the signed response must echo.
+/// Its lifetime runs on the monotonic clock, so wall-clock changes can
+/// neither extend nor cut the window. Deliberately not serializable: a
+/// challenge never leaves the process that minted it.
+#[derive(Debug, Clone, Copy)]
 pub struct Challenge {
-    #[serde(with = "serde_big_array::BigArray")]
+    /// Random bytes the response must echo.
     pub nonce: [u8; 32],
-    pub issued_at: DateTime<Utc>,
-    /// Challenges expire fast — a stale challenge is a replay window.
-    pub ttl: Duration,
+    /// When this process minted the challenge.
+    pub minted: Instant,
 }
 
 impl Challenge {
-    pub fn fresh(ttl: Duration) -> Self {
+    /// How long a response to this challenge is accepted after minting.
+    pub const TTL: Duration = Duration::from_secs(60);
+
+    /// Mint a challenge with a random nonce, starting its window now.
+    pub fn new() -> Self {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
         Self {
             nonce,
-            issued_at: Utc::now(),
-            ttl,
+            minted: Instant::now(),
         }
     }
 
-    /// Deterministic constructor for tests and for reconstructing a
-    /// challenge received over the wire.
-    pub fn from_parts(nonce: [u8; 32], issued_at: DateTime<Utc>, ttl: Duration) -> Self {
-        Self {
-            nonce,
-            issued_at,
-            ttl,
-        }
+    /// True once [`Challenge::TTL`] has elapsed since minting.
+    pub fn is_expired(&self) -> bool {
+        self.minted.elapsed() >= Self::TTL
     }
+}
 
-    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
-        now >= self.issued_at + self.ttl
+impl Default for Challenge {
+    fn default() -> Self {
+        Self::new()
     }
 }

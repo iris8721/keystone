@@ -2,11 +2,18 @@
 target/
 **/target/
 
-# Secrets — dev certs/keys are local-only, regenerate with xtask
+# Secrets and local server data (regenerate with xtask)
 *.pem
 *.key
 *.pfx
 !/.cargo/config.toml
+payload.secret
+accounts.json
+dev-accounts.json
+revoked-keys.json
+keystone.env
+payloads/
+downloads.jsonl
 
 # Editor / OS
 .DS_Store

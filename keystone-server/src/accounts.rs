@@ -1,92 +1,165 @@
-//! File-backed entitlement source — the real local account backend.
+//! File-backed entitlement source and the shared argon2 verifier.
 //!
-//! Accounts live in a JSON file (`KEYSTONE_ACCOUNTS`, default
-//! `./accounts.json`) managed by `cargo xtask account`. The file is
-//! re-read whenever its mtime changes, so `xtask` edits take effect
-//! without a restart — correctness over caching, since a stat per call
-//! is cheap next to an argon2 verify.
-//!
-//! Backend failures (missing or malformed file) surface as `Err`, which
-//! the routes translate to a 503 — an outage, not a denial. Bad
-//! credentials and missing grants are `Ok(None)`.
+//! Backend failures (missing or malformed file) are `Err`, which the
+//! routes answer with 503; bad credentials and missing grants are
+//! `Ok(None)`.
 
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
+use arc_swap::ArcSwap;
 use argon2::Argon2;
 use argon2::password_hash::{
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use keystone_core::{AccountFile, AccountIdentity, Entitlement, EntitlementSource, KeystoneError};
+use keystone_core::{AccountFile, AccountIdentity, BackendError, Entitlement, EntitlementSource};
+use tokio::sync::Semaphore;
+use zeroize::Zeroizing;
 
-/// Local account backend: reads `KEYSTONE_ACCOUNTS`, reloads on mtime
-/// change.
+/// Runs argon2 verification off the async executor, at most one per
+/// available core at a time, and pays the full cost for unknown accounts
+/// so timing does not reveal which accounts exist.
+pub(crate) struct SecretVerifier {
+    permits: Arc<Semaphore>,
+    dummy_hash: Arc<str>,
+}
+
+impl SecretVerifier {
+    pub(crate) fn new() -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self {
+            permits: Arc::new(Semaphore::new(parallelism)),
+            dummy_hash: hash_secret("keystone-timing-dummy").into(),
+        }
+    }
+
+    /// Whether `secret` matches `stored`; always false when `stored` is None.
+    pub(crate) async fn verify(
+        &self,
+        stored: Option<String>,
+        secret: &str,
+    ) -> Result<bool, BackendError> {
+        let _permit = self.permits.clone().acquire_owned().await?;
+        let known = stored.is_some();
+        let hash = stored.unwrap_or_else(|| self.dummy_hash.to_string());
+        let secret = Zeroizing::new(secret.to_owned());
+        let matched = tokio::task::spawn_blocking(move || {
+            let parsed = PasswordHash::new(&hash)
+                .map_err(|e| BackendError::from(format!("stored hash corrupt: {e}")))?;
+            Ok::<_, BackendError>(
+                Argon2::default()
+                    .verify_password(secret.as_bytes(), &parsed)
+                    .is_ok(),
+            )
+        })
+        .await??;
+        Ok(matched && known)
+    }
+}
+
+/// Argon2id PHC string for `secret` under a fresh salt.
+pub(crate) fn hash_secret(secret: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(secret.as_bytes(), &salt)
+        .expect("argon2 hashing with default parameters cannot fail")
+        .to_string()
+}
+
+const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+type Stamp = (Option<SystemTime>, u64);
+
+/// One published view of the accounts file.
+struct Snapshot {
+    loaded: Result<Arc<AccountFile>, Arc<str>>,
+    stamp: Option<Stamp>,
+    checked_at: Instant,
+}
+
+/// Local account backend over the accounts file (`KEYSTONE_ACCOUNTS`).
+/// The parsed file is published through an atomic pointer swap; readers
+/// never wait on a lock. The path is stat'd at most once per second, off
+/// the executor, and edits are picked up without a restart.
 pub struct LocalAccounts {
-    path: PathBuf,
-    /// mtime of the file as last successfully loaded. Failed loads do
-    /// not update it — a malformed file keeps erroring (and keeps being
-    /// retried) until an operator fixes it, rather than being cached as
-    /// a silent empty table.
-    last_mtime: Mutex<Option<SystemTime>>,
-    cache: Mutex<AccountFile>,
-    /// Constant argon2 hash verified for unknown accounts so a
-    /// missing-account lookup costs the same as a wrong-password one —
-    /// otherwise response timing leaks which accounts exist.
-    dummy_hash: String,
+    path: Arc<Path>,
+    verifier: SecretVerifier,
+    snapshot: ArcSwap<Snapshot>,
+    refreshing: AtomicBool,
 }
 
 impl LocalAccounts {
-    /// Open the backend at `path`. The initial load is attempted but
-    /// not fatal: a missing or malformed file means every call errors
-    /// (503) until the file is fixed — the server still starts, and no
-    /// restart is needed once it is.
+    /// Open the backend at `path`. A missing or malformed file is not fatal
+    /// here: every call errors (503) until the file is fixed.
     pub fn open(path: PathBuf) -> Self {
-        let salt = SaltString::generate(&mut OsRng);
-        let dummy_hash = Argon2::default()
-            .hash_password(b"keystone-timing-dummy", &salt)
-            .expect("argon2 hashing the timing dummy must not fail")
-            .to_string();
-        let (cache, last_mtime) = match AccountFile::load(&path) {
-            Ok(file) => (file, mtime(&path)),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "accounts file not loaded: {e} — backend will 503 until fixed");
-                (AccountFile::default(), None)
-            }
-        };
+        let snapshot = load(&path);
+        if let Err(e) = &snapshot.loaded {
+            tracing::warn!(path = %path.display(), "accounts file not loaded: {e}");
+        }
         Self {
-            path,
-            last_mtime: Mutex::new(last_mtime),
-            cache: Mutex::new(cache),
-            dummy_hash,
+            path: path.into(),
+            verifier: SecretVerifier::new(),
+            snapshot: ArcSwap::from_pointee(snapshot),
+            refreshing: AtomicBool::new(false),
         }
     }
 
-    /// The current account table, reloading when the file's mtime has
-    /// changed since the last successful load. Errors propagate — a
-    /// missing or malformed file is a backend failure, never a silent
-    /// "no accounts".
-    fn current(&self) -> Result<AccountFile, KeystoneError> {
-        let now_mtime = mtime(&self.path);
+    async fn current(&self) -> Result<Arc<AccountFile>, BackendError> {
+        let mut snapshot = self.snapshot.load_full();
+        // One caller refreshes a stale view; the rest keep using the old one.
+        if snapshot.checked_at.elapsed() >= RECHECK_INTERVAL
+            && self
+                .refreshing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         {
-            let last = self.last_mtime.lock().expect("accounts mtime poisoned");
-            if *last == now_mtime && last.is_some() {
-                return Ok(self.cache.lock().expect("accounts cache poisoned").clone());
-            }
+            let path = self.path.clone();
+            let previous = snapshot.clone();
+            let refreshed = tokio::task::spawn_blocking(move || refresh(&path, &previous)).await;
+            self.refreshing.store(false, Ordering::Release);
+            snapshot = Arc::new(refreshed?);
+            self.snapshot.store(snapshot.clone());
         }
-        let file = AccountFile::load(&self.path)?;
-        *self.cache.lock().expect("accounts cache poisoned") = file.clone();
-        *self.last_mtime.lock().expect("accounts mtime poisoned") = now_mtime;
-        Ok(file)
+        snapshot
+            .loaded
+            .clone()
+            .map_err(|e| BackendError::from(e.to_string()))
     }
 }
 
-/// The file's modification time, or `None` when it can't be stat'd —
-/// which forces a load attempt so the real error surfaces from `load`.
-fn mtime(path: &PathBuf) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok(), meta.len()))
+}
+
+fn load(path: &Path) -> Snapshot {
+    let stamp = stamp(path);
+    let loaded = AccountFile::load(path)
+        .map(Arc::new)
+        .map_err(|e| Arc::from(e.to_string()));
+    Snapshot {
+        loaded,
+        stamp,
+        checked_at: Instant::now(),
+    }
+}
+
+/// Reload when the file changed or the last load failed; otherwise keep the
+/// parsed file and only move the check time.
+fn refresh(path: &Path, previous: &Snapshot) -> Snapshot {
+    let now_stamp = stamp(path);
+    if previous.loaded.is_err() || now_stamp.is_none() || now_stamp != previous.stamp {
+        return load(path);
+    }
+    Snapshot {
+        loaded: previous.loaded.clone(),
+        stamp: previous.stamp,
+        checked_at: Instant::now(),
+    }
 }
 
 #[async_trait]
@@ -95,43 +168,34 @@ impl EntitlementSource for LocalAccounts {
         &self,
         account: &str,
         secret: &str,
-    ) -> Result<Option<AccountIdentity>, KeystoneError> {
-        let file = self.current()?;
-        let record = file.accounts.iter().find(|a| a.name == account);
-        // Unknown account → verify against the dummy hash anyway so the
-        // argon2 cost is paid either way and timing stays uniform.
-        let stored = record
-            .map(|a| a.secret_hash.as_str())
-            .unwrap_or(&self.dummy_hash);
-        let parsed = PasswordHash::new(stored)
-            .map_err(|e| KeystoneError::Malformed(format!("stored hash corrupt: {e}")))?;
-        let ok = Argon2::default()
-            .verify_password(secret.as_bytes(), &parsed)
-            .is_ok();
-        if ok && record.is_some() {
-            Ok(Some(AccountIdentity {
+    ) -> Result<Option<AccountIdentity>, BackendError> {
+        let file = self.current().await?;
+        let stored = file
+            .accounts
+            .iter()
+            .find(|a| a.name == account)
+            .map(|a| a.secret_hash.clone());
+        Ok(self
+            .verifier
+            .verify(stored, secret)
+            .await?
+            .then(|| AccountIdentity {
                 account: account.to_string(),
             }))
-        } else {
-            // Bad credentials are a denial, not a backend failure.
-            Ok(None)
-        }
     }
 
     async fn entitlement(
         &self,
         account: &str,
         product: &str,
-    ) -> Result<Option<Entitlement>, KeystoneError> {
-        let file = self.current()?;
+    ) -> Result<Option<Entitlement>, BackendError> {
+        let file = self.current().await?;
         let now = Utc::now();
         Ok(file
             .accounts
             .iter()
             .find(|a| a.name == account)
             .and_then(|a| a.entitlements.iter().find(|g| g.product == product))
-            // An expired grant authorizes nothing — report it the same
-            // as no grant so the answer can't distinguish the two.
             .filter(|g| now < g.expires_at)
             .map(|g| Entitlement {
                 account: account.to_string(),
@@ -141,12 +205,8 @@ impl EntitlementSource for LocalAccounts {
             }))
     }
 
-    /// The account's pinned client-cert fingerprint, decoded from hex.
-    /// `Some` means /exchange must see exactly this cert (CN = account
-    /// name) at the TLS layer; `None` means any CA-issued cert
-    /// authenticates the install.
-    async fn cert_sha256(&self, account: &str) -> Result<Option<[u8; 32]>, KeystoneError> {
-        let file = self.current()?;
+    async fn cert_sha256(&self, account: &str) -> Result<Option<[u8; 32]>, BackendError> {
+        let file = self.current().await?;
         let Some(hex_hash) = file
             .accounts
             .iter()
@@ -155,15 +215,10 @@ impl EntitlementSource for LocalAccounts {
         else {
             return Ok(None);
         };
-        let bytes = hex::decode(hex_hash).map_err(|e| {
-            KeystoneError::Malformed(format!("cert_sha256 for {account} is not hex: {e}"))
-        })?;
-        let hash: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            KeystoneError::Malformed(format!(
-                "cert_sha256 for {account} is {} bytes, expected 32",
-                bytes.len()
-            ))
-        })?;
+        let hash = hex::decode(hex_hash)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .ok_or_else(|| BackendError::from("cert_sha256 is not 64 hex characters"))?;
         Ok(Some(hash))
     }
 }

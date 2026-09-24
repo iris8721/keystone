@@ -9,9 +9,13 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["iris8721"]
 license = "MIT"
+repository = "https://github.com/iris8721/keystone"
+readme = "README.md"
+keywords = ["licensing", "authentication", "mtls", "ed25519", "session"]
+categories = ["authentication", "cryptography"]
 
 [profile.dev]
 opt-level = 1

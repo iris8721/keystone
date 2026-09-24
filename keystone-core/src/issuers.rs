@@ -30,11 +30,32 @@ impl TrustedIssuers {
         Self::new([(key_id, key)])
     }
 
+    /// A trust root holding `keys`, nothing revoked.
     pub fn new(keys: impl IntoIterator<Item = (u8, VerifyingKey)>) -> Self {
         Self {
             keys: keys.into_iter().collect(),
             revoked: BTreeSet::new(),
         }
+    }
+
+    /// A trust root from raw 32-byte Ed25519 public keys. `Malformed` on a
+    /// key that is not a valid curve point or on a repeated key id.
+    pub fn from_public_keys(keys: impl IntoIterator<Item = (u8, [u8; 32])>) -> Result<Self> {
+        let mut map = BTreeMap::new();
+        for (key_id, bytes) in keys {
+            let key = VerifyingKey::from_bytes(&bytes).map_err(|_| {
+                KeystoneError::Malformed(format!("issuer key {key_id} is not a valid public key"))
+            })?;
+            if map.insert(key_id, key).is_some() {
+                return Err(KeystoneError::Malformed(format!(
+                    "issuer key id {key_id} appears twice"
+                )));
+            }
+        }
+        Ok(Self {
+            keys: map,
+            revoked: BTreeSet::new(),
+        })
     }
 
     /// Add or replace the key under `key_id`. Does not clear a prior
@@ -50,6 +71,7 @@ impl TrustedIssuers {
         self.revoked.insert(key_id);
     }
 
+    /// Whether `key_id` was revoked.
     pub fn is_revoked(&self, key_id: u8) -> bool {
         self.revoked.contains(&key_id)
     }
@@ -71,6 +93,7 @@ impl TrustedIssuers {
         self.keys.keys().copied().collect()
     }
 
+    /// Every revoked id, ascending.
     pub fn revoked_ids(&self) -> Vec<u8> {
         self.revoked.iter().copied().collect()
     }
@@ -93,9 +116,31 @@ mod tests {
     use crate::crypto::Issuer;
 
     #[test]
+    fn from_public_keys_accepts_valid_and_rejects_bad_input() {
+        let issuer = Issuer::generate(1);
+        let raw = issuer.verifying_key().to_bytes();
+        let trusted = TrustedIssuers::from_public_keys([(1, raw)]).unwrap();
+        assert_eq!(trusted.key_for(1).unwrap(), &issuer.verifying_key());
+
+        // y = 2 has no matching x on edwards25519.
+        let mut off_curve = [0u8; 32];
+        off_curve[0] = 2;
+        assert!(matches!(
+            TrustedIssuers::from_public_keys([(1, raw), (2, off_curve)]),
+            Err(KeystoneError::Malformed(_))
+        ));
+
+        let other = Issuer::generate(1).verifying_key().to_bytes();
+        assert!(matches!(
+            TrustedIssuers::from_public_keys([(1, raw), (1, other)]),
+            Err(KeystoneError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn key_for_resolves_by_id() {
-        let a = Issuer::generate_with_id(1);
-        let b = Issuer::generate_with_id(2);
+        let a = Issuer::generate(1);
+        let b = Issuer::generate(2);
         let trusted = TrustedIssuers::new([(1, a.verifying_key()), (2, b.verifying_key())]);
         assert_eq!(trusted.key_for(1).unwrap(), &a.verifying_key());
         assert_eq!(trusted.key_for(2).unwrap(), &b.verifying_key());
@@ -107,7 +152,7 @@ mod tests {
 
     #[test]
     fn revoke_is_one_way() {
-        let a = Issuer::generate_with_id(1);
+        let a = Issuer::generate(1);
         let mut trusted = TrustedIssuers::single(1, a.verifying_key());
         trusted.revoke(1);
         assert!(trusted.is_revoked(1));
@@ -126,7 +171,7 @@ mod tests {
     fn revoking_unknown_id_is_remembered() {
         let mut trusted = TrustedIssuers::new([]);
         trusted.revoke(9);
-        trusted.insert(9, Issuer::generate_with_id(9).verifying_key());
+        trusted.insert(9, Issuer::generate(9).verifying_key());
         assert!(matches!(
             trusted.key_for(9),
             Err(KeystoneError::UntrustedIssuer { key_id: 9 })
@@ -135,7 +180,7 @@ mod tests {
 
     #[test]
     fn debug_prints_ids_not_keys() {
-        let a = Issuer::generate_with_id(4);
+        let a = Issuer::generate(4);
         let mut trusted = TrustedIssuers::single(4, a.verifying_key());
         trusted.revoke(2);
         let out = format!("{trusted:?}");

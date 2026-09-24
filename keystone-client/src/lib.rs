@@ -1,32 +1,31 @@
-//! keystone-client — the SDK loaders and payloads link against to
-//! consume keystone-server.
+//! keystone-client: the SDK loaders and payloads link against to consume a
+//! keystone server.
 //!
-//! Implements the client half of the README contract: exchange
-//! credentials for a signed, bounded session; attest independently from
-//! the application side; renew the lease with MAC'd heartbeats; and
-//! degrade into a fixed grace window — never silent trust — when the
-//! server can't be reached.
-//!
-//! The client trusts exactly the issuer set baked into the build: a
-//! `TrustedIssuers` map of key id to ed25519 verifying key. Every
-//! envelope and manifest is verified against it before anything it
-//! carries is believed. The set is never learned from a handoff or
-//! the network — it only shrinks, when a key is revoked.
+//! A loader exchanges credentials for a session, keeps it alive with
+//! [`KeystoneClient::run_keepalive`], and launches its payload with a
+//! single-use [`HandoffToken`]. The payload redeems the token for a session
+//! of its own and checks [`SessionGate`] before protected operations. Every
+//! signed value is verified against the [`TrustedIssuers`] baked into the
+//! build.
 
-pub mod client;
-pub mod error;
-pub mod session;
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
-pub use client::{ClientIdentity, KeystoneClient};
+mod admin;
+mod client;
+mod error;
+pub mod handoff;
+mod session;
+mod transport;
+
+pub use admin::{AdminClient, AdminClientBuilder};
+pub use client::{ClientBuilder, KeystoneClient, Payload};
 pub use error::ClientError;
-pub use session::ClientSession;
+pub use session::{ClientSession, PendingSession, SessionGate};
+pub use transport::ClientIdentity;
 
-// The app side of a handoff opens a `Handoff` — re-exported so a
-// payload depending only on keystone-client can still name the type.
-pub use keystone_core::{Handoff, HandoffPayload};
-// Payload fetches return a `SignedManifest` — re-exported alongside so
-// a payload crate needs only keystone-client on its dependency list.
-pub use keystone_core::{FeatureGrant, Manifest, SignedManifest};
-// Every constructor takes the trusted issuer set — re-exported so a
-// consumer can build one without naming keystone-core.
-pub use keystone_core::TrustedIssuers;
+pub use keystone_core::wire::{DEFAULT_HANDOFF_TTL, ErrorCode, PublishBody, RevokeBody, Verdict};
+pub use keystone_core::{
+    BackendError, DeadReason, FeatureGrant, HandoffToken, KeystoneError, Manifest, SignedManifest,
+    TrustedIssuers, VerifyingKey,
+};

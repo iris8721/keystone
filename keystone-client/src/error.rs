@@ -1,70 +1,89 @@
 //! Client-side error taxonomy.
-//!
-//! The distinctions mirror what the state machine needs: `ServerRejected`
-//! carries the HTTP status so a session-bound call can tell "verdict,
-//! die now" (401/403/404/410 without a transient `code`) from "unknown,
-//! burn grace" (a transient `code` — `artifact_not_found`,
-//! `session_not_active`, `rate_limited`, `stale_request` — or 409/5xx),
-//! and `GraceExhausted` is the *client's own* decision — the server may
-//! be unreachable and never get a vote.
 
-use keystone_core::KeystoneError;
+use keystone_core::wire::{ErrorCode, Verdict};
+use keystone_core::{BackendError, KeystoneError};
 
 /// Every way a client operation can fail.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
-    /// A core check failed — signature, MAC, challenge echo, expiry.
-    /// These mean the *response* was untrustworthy, not that the
-    /// session is dead.
+    /// A local check failed before or instead of a request: request
+    /// validation, handoff token opening, a failed verification task.
     #[error(transparent)]
     Core(#[from] KeystoneError),
 
-    /// Transport failure — DNS, connect, TLS, timeout. Always
-    /// transient: the server never saw the request, so its view of the
-    /// session is unchanged.
+    /// The server answered 2xx but the response failed verification:
+    /// signature, challenge, scope, freshness, body shape, or payload hash.
+    /// Nothing it carried was accepted.
+    #[error("invalid server response: {0}")]
+    InvalidResponse(#[source] KeystoneError),
+
+    /// The server answered non-2xx. `code` is `None` when the body was not
+    /// a keystone `ErrorBody`, which is always treated as transient.
+    #[error("server rejected request: {status} {message}")]
+    ServerRejected {
+        /// HTTP status.
+        status: u16,
+        /// Keystone error code, when the body carried one.
+        code: Option<ErrorCode>,
+        /// Human-readable reason.
+        message: String,
+    },
+
+    /// Connect, TLS, timeout, or body transfer failure.
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
 
-    /// The server answered with a non-2xx status and an `{"error"}`
-    /// body. On session-bound routes the session's fate is decided by
-    /// the optional `code` first — `artifact_not_found`,
-    /// `session_not_active`, `rate_limited`, and `stale_request` are
-    /// transient (grace, not death) — then by `status`: 401 and 404
-    /// kill the session as Rejected, 403 as Revoked, 410 as Expired (or
-    /// GraceExhausted when the session was already in grace); every
-    /// other status is treated as a lost response and burns grace.
-    /// Routes with no session to map onto (exchange, revoke) surface
-    /// the status unchanged.
-    #[error("server rejected request: {status} {message}")]
-    ServerRejected { status: u16, message: String },
-
-    /// An operation that needs a live session was attempted on one
-    /// that never authenticated or is already dead.
+    /// The session is dead or its lease no longer authorizes anything;
+    /// the reason is available from `dead_reason()`.
     #[error("session is not authenticated")]
     NotAuthenticated,
 
-    /// The grace deadline passed while the server was unreachable.
-    /// Distinct from `KeystoneError::GraceExhausted`: the server never
-    /// ruled on this — the client decided locally, per the lease's
-    /// fixed grace window.
-    #[error("grace period exhausted")]
-    GraceExhausted,
+    /// Builder input was rejected: URL, PEM material, TLS setup, or admin
+    /// token. `source` carries the underlying parser or TLS error.
+    #[error("invalid client configuration: {message}")]
+    InvalidConfig {
+        /// What was rejected.
+        message: String,
+        /// The error that caused the rejection, if any.
+        #[source]
+        source: Option<BackendError>,
+    },
+}
 
-    /// Session key material is gone — the session was killed and its
-    /// key dropped, so no further MACs can be produced.
-    #[error("session key material unavailable")]
-    MissingSessionKey,
+impl ClientError {
+    /// Whether retrying the same operation later can succeed: transport
+    /// failures, unverifiable responses, code-less rejections, and
+    /// rejections whose code has a transient verdict.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            ClientError::Transport(_) | ClientError::InvalidResponse(_) => true,
+            ClientError::ServerRejected { code, .. } => {
+                matches!(session_verdict(*code), Verdict::Transient)
+            }
+            ClientError::Core(_)
+            | ClientError::NotAuthenticated
+            | ClientError::InvalidConfig { .. } => false,
+        }
+    }
 
-    /// `new`/`new_unpinned_webpki` require an https base URL — plaintext
-    /// transport would expose credentials and session material to
-    /// anyone on the path. `KeystoneClient::new_insecure` exists for
-    /// dev/test only.
-    #[error("base_url must be https (KeystoneClient::new_insecure exists for dev/test): {0}")]
-    InsecureBaseUrl(String),
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        ClientError::InvalidConfig {
+            message: message.into(),
+            source: None,
+        }
+    }
 
-    /// TLS configuration failed at construction — a malformed CA or
-    /// client-certificate PEM, or a rustls build error. Surfaces
-    /// before any request is attempted.
-    #[error("TLS configuration failed: {0}")]
-    Tls(String),
+    pub(crate) fn config_from(message: impl Into<String>, source: impl Into<BackendError>) -> Self {
+        ClientError::InvalidConfig {
+            message: message.into(),
+            source: Some(source.into()),
+        }
+    }
+}
+
+/// The session verdict for a rejection; a response without a keystone
+/// error code is transient.
+pub(crate) fn session_verdict(code: Option<ErrorCode>) -> Verdict {
+    code.map_or(Verdict::Transient, ErrorCode::verdict)
 }

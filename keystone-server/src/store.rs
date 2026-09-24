@@ -1,233 +1,569 @@
-//! In-memory session store.
+//! Session, nonce, and handoff storage.
 //!
-//! Sessions are the server's authority over live access: who holds a
-//! lease, what state the session is in, which response nonces are
-//! already spent. Losing them on restart is safe by design — clients
-//! simply re-exchange, and nothing offline can resurrect a session.
+//! Routes read a record with its version, validate, and write back with
+//! compare-and-swap, so concurrent requests on one session never lose an
+//! update. Nonce consumption and handoff redemption are atomic
+//! insert-if-absent / take operations with exactly one winner.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, RwLock};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use keystone_core::{ConsumedSet, DeadReason, SessionState};
+use keystone_core::{BackendError, ConsumedSet, DeadReason, Lease};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-/// Everything the server knows about one live session. Not Clone on
-/// purpose: the session key must not be casually copied — read paths
-/// get a `SessionView` instead.
+/// Everything the server knows about one session. Serializable for durable
+/// stores; `Debug` redacts the key.
+#[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionRecord {
+    /// The session.
     pub session_id: Uuid,
+    /// Account that owns the session.
     pub account: String,
+    /// Product the session is for; payload routes serve nothing else.
     pub product: String,
-    /// sha256 of the client-supplied HWID fingerprint. An anomaly
-    /// signal, not identity (README: assume spoofable) — and never
-    /// the raw fingerprint, so the store can't be mined for hardware
-    /// IDs.
+    /// Loader session this child was attested from; `None` for exchanged sessions.
+    pub parent: Option<Uuid>,
+    /// sha256 of the exchange HWID fingerprint.
     pub hwid_hash: [u8; 32],
-    /// Per-session symmetric key minted at exchange. Heartbeat and
-    /// attest MACs prove possession of it; it never leaves the
-    /// exchange response.
-    pub session_key: [u8; 32],
-    /// Sessions must not outlive the grant that created them —
-    /// heartbeat kills the session once this passes.
-    pub entitlement_expires_at: DateTime<Utc>,
-    /// sha256 of the client certificate the exchange was performed
-    /// with, recorded only when the account pins one. Every later
-    /// MAC'd request on this session must arrive over the same cert —
-    /// a lifted session key is useless without the install's identity.
+    /// Key for the session's request MACs.
+    pub session_key: Zeroizing<[u8; 32]>,
+    /// sha256 of the client certificate the session was created over;
+    /// every later request must present the same certificate.
     pub cert_sha256: Option<[u8; 32]>,
-    pub state: SessionState,
-    /// Heartbeat nonces already accepted for this session — replay
-    /// rejection for client-generated nonces.
-    pub consumed: ConsumedSet,
-    pub created_at: DateTime<Utc>,
+    /// Expiry of the grant as last resolved.
+    pub grant_expires_at: DateTime<Utc>,
+    /// The most recent lease granted.
+    pub lease: Lease,
+    /// Set once the session is over; dead records are kept until the last
+    /// lease plus grace has passed.
+    pub dead: Option<DeadReason>,
 }
 
-/// Manual Debug: the session key is the proof-of-possession secret for
-/// every MAC'd route — it must never reach a log line.
+impl SessionRecord {
+    /// The instant after which no client can still hold this session alive.
+    pub fn retain_until(&self) -> DateTime<Utc> {
+        self.lease.expires_at + self.lease.grace_period
+    }
+}
+
 impl fmt::Debug for SessionRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionRecord")
             .field("session_id", &self.session_id)
             .field("account", &self.account)
             .field("product", &self.product)
-            .field("hwid_hash", &self.hwid_hash)
+            .field("parent", &self.parent)
             .field("session_key", &"[redacted]")
-            .field("entitlement_expires_at", &self.entitlement_expires_at)
             .field(
                 "cert_sha256",
                 &self.cert_sha256.map_or("absent", |_| "present"),
             )
-            .field("state", &self.state)
-            .field("consumed", &self.consumed)
-            .field("created_at", &self.created_at)
-            .finish()
+            .field("grant_expires_at", &self.grant_expires_at)
+            .field("lease", &self.lease)
+            .field("dead", &self.dead)
+            .finish_non_exhaustive()
     }
 }
 
-/// Sanitized snapshot for read paths — everything except the session
-/// key and the consumed set, which no reader outside `with_mut` should
-/// ever touch.
-#[derive(Debug)]
-pub struct SessionView {
-    pub session_id: Uuid,
+/// An outstanding single-use handoff. Serializable for durable stores;
+/// `Debug` redacts the secret.
+#[derive(Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct HandoffRecord {
+    /// Identifies the handoff at attest time.
+    pub handoff_id: [u8; 32],
+    /// Keys the attest MAC and the child session key wrap.
+    pub secret: Zeroizing<[u8; 32]>,
+    /// The session that minted it.
+    pub parent: Uuid,
+    /// Identity the child must attest under.
+    pub process_id: String,
+    /// Account of the parent.
     pub account: String,
+    /// Product of the parent.
     pub product: String,
-    pub hwid_hash: [u8; 32],
-    pub entitlement_expires_at: DateTime<Utc>,
-    pub state: SessionState,
-    pub created_at: DateTime<Utc>,
+    /// Last instant the handoff can be redeemed (exclusive).
+    pub expires_at: DateTime<Utc>,
 }
 
-/// (hwid_hash, last_seen) — factored out of the map type for clarity.
-type FingerprintSighting = ([u8; 32], DateTime<Utc>);
-
-/// `Arc`-shared so `AppState` clones cheaply; `RwLock` because reads
-/// (attest lookups) vastly outnumber writes.
-#[derive(Debug, Clone, Default)]
-pub struct SessionStore {
-    sessions: Arc<RwLock<HashMap<Uuid, SessionRecord>>>,
-    /// account → (hwid_hash, last_seen). The anomaly signal from
-    /// README: same account presenting a materially different
-    /// fingerprint inside a short window is worth flagging — never a
-    /// hard gate, because facade exists and HWID is spoofable.
-    fingerprints: Arc<RwLock<HashMap<String, FingerprintSighting>>>,
+impl fmt::Debug for HandoffRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandoffRecord")
+            .field("handoff_id", &hex::encode(self.handoff_id))
+            .field("secret", &"[redacted]")
+            .field("parent", &self.parent)
+            .field("process_id", &self.process_id)
+            .field("product", &self.product)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
-impl SessionStore {
+/// Session storage seam. Implementations must make `replace`,
+/// `consume_nonce`, `insert_handoff`, `take_handoff`, and
+/// `bump_account_epoch` atomic.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    /// Store a new record at version 0.
+    async fn insert(&self, record: SessionRecord) -> Result<(), BackendError>;
+
+    /// The record and its current version.
+    async fn get(&self, id: &Uuid) -> Result<Option<(SessionRecord, u64)>, BackendError>;
+
+    /// Write `record` only if the stored version is still `expected_version`;
+    /// false when another writer got there first or the record is gone.
+    async fn replace(
+        &self,
+        id: &Uuid,
+        expected_version: u64,
+        record: SessionRecord,
+    ) -> Result<bool, BackendError>;
+
+    /// Every session of `account`.
+    async fn ids_for_account(&self, account: &str) -> Result<Vec<Uuid>, BackendError>;
+
+    /// Direct children of `parent`.
+    async fn children_of(&self, parent: &Uuid) -> Result<Vec<Uuid>, BackendError>;
+
+    /// Every stored session.
+    async fn all_ids(&self) -> Result<Vec<Uuid>, BackendError>;
+
+    /// Record `nonce` for `session_id` until `expires_at`; true for exactly
+    /// one caller per nonce, false for replays, stale values, or an unknown
+    /// session.
+    async fn consume_nonce(
+        &self,
+        session_id: &Uuid,
+        nonce: [u8; 32],
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, BackendError>;
+
+    /// Store a handoff unless its parent already has `max_per_parent`
+    /// unexpired handoffs outstanding; false when over the limit.
+    async fn insert_handoff(
+        &self,
+        record: HandoffRecord,
+        max_per_parent: usize,
+    ) -> Result<bool, BackendError>;
+
+    /// Remove and return a handoff; exactly one caller gets it.
+    async fn take_handoff(
+        &self,
+        handoff_id: &[u8; 32],
+    ) -> Result<Option<HandoffRecord>, BackendError>;
+
+    /// How many times `account` has been revoked; 0 for accounts never revoked.
+    async fn account_epoch(&self, account: &str) -> Result<u64, BackendError>;
+
+    /// Increment the revocation epoch of `account`.
+    async fn bump_account_epoch(&self, account: &str) -> Result<(), BackendError>;
+
+    /// Drop sessions past [`SessionRecord::retain_until`], expired handoffs,
+    /// and expired nonces; returns the number of sessions dropped.
+    async fn sweep(&self, now: DateTime<Utc>) -> Result<usize, BackendError>;
+}
+
+struct Slot {
+    record: SessionRecord,
+    version: u64,
+    nonces: ConsumedSet,
+}
+
+#[derive(Default)]
+struct Tables {
+    sessions: HashMap<Uuid, Slot>,
+    handoffs: HashMap<[u8; 32], HandoffRecord>,
+    epochs: HashMap<String, u64>,
+}
+
+/// In-process [`SessionStore`]. Everything is lost on restart, which is
+/// safe: clients see `unknown_session` and re-exchange.
+#[derive(Default)]
+pub struct MemoryStore {
+    tables: Mutex<Tables>,
+}
+
+impl MemoryStore {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(&self, record: SessionRecord) {
-        self.sessions
-            .write()
-            .expect("session store poisoned")
-            .insert(record.session_id, record);
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Tables> {
+        self.tables.lock()
+    }
+}
+
+impl fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tables = self.lock();
+        f.debug_struct("MemoryStore")
+            .field("sessions", &tables.sessions.len())
+            .field("handoffs", &tables.handoffs.len())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl SessionStore for MemoryStore {
+    async fn insert(&self, record: SessionRecord) -> Result<(), BackendError> {
+        self.lock().sessions.insert(
+            record.session_id,
+            Slot {
+                record,
+                version: 0,
+                nonces: ConsumedSet::new(),
+            },
+        );
+        Ok(())
     }
 
-    /// Sanitized snapshot of a session. For check-then-update flows use
-    /// `with_mut` instead — a read followed by a separate write opens a
-    /// race between concurrent requests on the same session.
-    pub fn get(&self, session_id: &Uuid) -> Option<SessionView> {
-        self.sessions
-            .read()
-            .expect("session store poisoned")
-            .get(session_id)
-            .map(|rec| SessionView {
-                session_id: rec.session_id,
-                account: rec.account.clone(),
-                product: rec.product.clone(),
-                hwid_hash: rec.hwid_hash,
-                entitlement_expires_at: rec.entitlement_expires_at,
-                state: rec.state.clone(),
-                created_at: rec.created_at,
-            })
+    async fn get(&self, id: &Uuid) -> Result<Option<(SessionRecord, u64)>, BackendError> {
+        Ok(self
+            .lock()
+            .sessions
+            .get(id)
+            .map(|slot| (slot.record.clone(), slot.version)))
     }
 
-    /// Atomic check-and-mutate under one write lock. The closure
-    /// returns the handler's result so state inspection and update
-    /// can't be interleaved by another request.
-    pub fn with_mut<R>(
+    async fn replace(
+        &self,
+        id: &Uuid,
+        expected_version: u64,
+        record: SessionRecord,
+    ) -> Result<bool, BackendError> {
+        let mut tables = self.lock();
+        match tables.sessions.get_mut(id) {
+            Some(slot) if slot.version == expected_version => {
+                slot.record = record;
+                slot.version += 1;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn ids_for_account(&self, account: &str) -> Result<Vec<Uuid>, BackendError> {
+        Ok(self
+            .lock()
+            .sessions
+            .values()
+            .filter(|slot| slot.record.account == account)
+            .map(|slot| slot.record.session_id)
+            .collect())
+    }
+
+    async fn children_of(&self, parent: &Uuid) -> Result<Vec<Uuid>, BackendError> {
+        Ok(self
+            .lock()
+            .sessions
+            .values()
+            .filter(|slot| slot.record.parent.as_ref() == Some(parent))
+            .map(|slot| slot.record.session_id)
+            .collect())
+    }
+
+    async fn all_ids(&self) -> Result<Vec<Uuid>, BackendError> {
+        Ok(self.lock().sessions.keys().copied().collect())
+    }
+
+    async fn consume_nonce(
         &self,
         session_id: &Uuid,
-        f: impl FnOnce(&mut SessionRecord) -> R,
-    ) -> Option<R> {
-        self.sessions
-            .write()
-            .expect("session store poisoned")
-            .get_mut(session_id)
-            .map(f)
-    }
-
-    /// Explicit revocation — immediate death, no grace.
-    pub fn revoke(&self, session_id: &Uuid) -> bool {
-        self.with_mut(session_id, |rec| rec.state.kill(DeadReason::Revoked))
-            .is_some()
-    }
-
-    /// Kill every live session belonging to `account` — the
-    /// operator-facing "pull this user" form of revocation. Returns
-    /// how many sessions were killed; already-dead records keep their
-    /// original reason.
-    pub fn revoke_account(&self, account: &str) -> usize {
-        let mut killed = 0;
-        for rec in self
-            .sessions
-            .write()
-            .expect("session store poisoned")
-            .values_mut()
-        {
-            if rec.account == account && !matches!(rec.state, SessionState::Dead { .. }) {
-                rec.state.kill(DeadReason::Revoked);
-                killed += 1;
-            }
-        }
-        killed
-    }
-
-    /// Kill every live session, whatever the account — the response to
-    /// a compromised issuer key (README: revoke the key AND
-    /// invalidate affected sessions). Returns how many were killed;
-    /// already-dead records keep their original reason.
-    pub fn revoke_all(&self, reason: DeadReason) -> usize {
-        let mut killed = 0;
-        for rec in self
-            .sessions
-            .write()
-            .expect("session store poisoned")
-            .values_mut()
-        {
-            if !matches!(rec.state, SessionState::Dead { .. }) {
-                rec.state.kill(reason);
-                killed += 1;
-            }
-        }
-        killed
-    }
-
-    /// Reclaim records that can never matter again: sessions whose
-    /// lease plus grace window has fully passed. Dead records are kept
-    /// until then — dropping them early would turn "revoked" into
-    /// "unknown" and lose the 403-vs-404 distinction.
-    pub fn sweep(&self, now: DateTime<Utc>) {
-        self.sessions
-            .write()
-            .expect("session store poisoned")
-            .retain(|_, rec| match &rec.state {
-                SessionState::Active { lease } => now <= lease.expires_at + lease.grace_period,
-                // The server is authoritative: it only ever creates
-                // Active or Dead — Grace is client-side bookkeeping.
-                // A Grace record here means the store was seeded from
-                // outside; retain it like Dead so it can't linger
-                // past the grant that created it.
-                SessionState::Grace { .. } | SessionState::Dead { .. } => {
-                    now <= rec.entitlement_expires_at
-                }
-            });
-    }
-
-    /// Record a fingerprint sighting for an account. Returns true when
-    /// the account was seen inside `window` with a DIFFERENT hash —
-    /// the anomaly case. First sightings and same-hash re-sightings
-    /// return false. The record updates either way.
-    pub fn check_fingerprint(
-        &self,
-        account: &str,
-        hwid_hash: [u8; 32],
-        now: DateTime<Utc>,
-        window: chrono::Duration,
-    ) -> bool {
-        let mut fps = self
-            .fingerprints
-            .write()
-            .expect("fingerprint cache poisoned");
-        let anomalous = match fps.get(account) {
-            Some((prev, seen)) => *prev != hwid_hash && now - *seen < window,
-            None => false,
+        nonce: [u8; 32],
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, BackendError> {
+        let mut tables = self.lock();
+        let Some(slot) = tables.sessions.get_mut(session_id) else {
+            return Ok(false);
         };
-        fps.insert(account.to_string(), (hwid_hash, now));
-        anomalous
+        Ok(slot.nonces.consume(nonce, expires_at, Utc::now()).is_ok())
+    }
+
+    async fn insert_handoff(
+        &self,
+        record: HandoffRecord,
+        max_per_parent: usize,
+    ) -> Result<bool, BackendError> {
+        let now = Utc::now();
+        let mut tables = self.lock();
+        let outstanding = tables
+            .handoffs
+            .values()
+            .filter(|h| h.parent == record.parent && h.expires_at > now)
+            .count();
+        if outstanding >= max_per_parent {
+            return Ok(false);
+        }
+        tables.handoffs.insert(record.handoff_id, record);
+        Ok(true)
+    }
+
+    async fn take_handoff(
+        &self,
+        handoff_id: &[u8; 32],
+    ) -> Result<Option<HandoffRecord>, BackendError> {
+        Ok(self.lock().handoffs.remove(handoff_id))
+    }
+
+    async fn account_epoch(&self, account: &str) -> Result<u64, BackendError> {
+        Ok(self.lock().epochs.get(account).copied().unwrap_or(0))
+    }
+
+    async fn bump_account_epoch(&self, account: &str) -> Result<(), BackendError> {
+        *self.lock().epochs.entry(account.to_string()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    async fn sweep(&self, now: DateTime<Utc>) -> Result<usize, BackendError> {
+        let mut tables = self.lock();
+        let before = tables.sessions.len();
+        tables
+            .sessions
+            .retain(|_, slot| now <= slot.record.retain_until());
+        for slot in tables.sessions.values_mut() {
+            slot.nonces.evict_expired(now);
+        }
+        tables.handoffs.retain(|_, h| h.expires_at > now);
+        Ok(before - tables.sessions.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::Duration;
+
+    use super::*;
+
+    fn record(lease_expires_at: DateTime<Utc>, grace: Duration) -> SessionRecord {
+        let session_id = Uuid::new_v4();
+        SessionRecord {
+            session_id,
+            account: "dev".into(),
+            product: "dev-product".into(),
+            parent: None,
+            hwid_hash: [0u8; 32],
+            session_key: Zeroizing::new([0xAB; 32]),
+            cert_sha256: Some([0xCD; 32]),
+            grant_expires_at: Utc::now() + Duration::days(30),
+            lease: Lease {
+                session_id,
+                granted_at: Utc::now(),
+                expires_at: lease_expires_at,
+                grace_period: grace,
+            },
+            dead: None,
+        }
+    }
+
+    fn handoff(parent: Uuid, expires_at: DateTime<Utc>) -> HandoffRecord {
+        let mut id = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id);
+        HandoffRecord {
+            handoff_id: id,
+            secret: Zeroizing::new([7u8; 32]),
+            parent,
+            process_id: "app.exe".into(),
+            account: "dev".into(),
+            product: "dev-product".into(),
+            expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_is_compare_and_swap() {
+        let store = MemoryStore::new();
+        let rec = record(Utc::now() + Duration::minutes(5), Duration::seconds(60));
+        let id = rec.session_id;
+        store.insert(rec).await.unwrap();
+        let (mut first, version) = store.get(&id).await.unwrap().unwrap();
+        let (mut second, same_version) = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(version, same_version);
+
+        first.dead = Some(DeadReason::Revoked);
+        assert!(store.replace(&id, version, first).await.unwrap());
+        second.account = "stale writer".into();
+        assert!(!store.replace(&id, version, second).await.unwrap());
+        let (stored, newer) = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(stored.dead, Some(DeadReason::Revoked));
+        assert_eq!(stored.account, "dev");
+        assert_ne!(newer, version);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nonce_is_consumed_by_exactly_one_caller() {
+        let store = Arc::new(MemoryStore::new());
+        let rec = record(Utc::now() + Duration::minutes(5), Duration::seconds(60));
+        let id = rec.session_id;
+        store.insert(rec).await.unwrap();
+        let expires = Utc::now() + Duration::minutes(5);
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(
+                    async move { store.consume_nonce(&id, [5u8; 32], expires).await.unwrap() },
+                )
+            })
+            .collect();
+        let mut winners = 0;
+        for task in tasks {
+            winners += usize::from(task.await.unwrap());
+        }
+        assert_eq!(winners, 1);
+        assert!(
+            !store
+                .consume_nonce(&id, [6u8; 32], Utc::now())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .consume_nonce(&Uuid::new_v4(), [6u8; 32], expires)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handoff_is_taken_by_exactly_one_caller() {
+        let store = Arc::new(MemoryStore::new());
+        let h = handoff(Uuid::new_v4(), Utc::now() + Duration::minutes(1));
+        let id = h.handoff_id;
+        assert!(store.insert_handoff(h, 4).await.unwrap());
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.take_handoff(&id).await.unwrap().is_some() })
+            })
+            .collect();
+        let mut winners = 0;
+        for task in tasks {
+            winners += usize::from(task.await.unwrap());
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn outstanding_handoffs_are_capped_per_parent() {
+        let store = MemoryStore::new();
+        let parent = Uuid::new_v4();
+        let live = Utc::now() + Duration::minutes(1);
+        for _ in 0..2 {
+            assert!(
+                store
+                    .insert_handoff(handoff(parent, live), 2)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            !store
+                .insert_handoff(handoff(parent, live), 2)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_handoff(handoff(Uuid::new_v4(), live), 2)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_records_until_lease_plus_grace() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let mut dead_in_grace = record(now - Duration::seconds(10), Duration::seconds(60));
+        dead_in_grace.dead = Some(DeadReason::Revoked);
+        let mut dead_past_grace = record(now - Duration::seconds(90), Duration::seconds(60));
+        dead_past_grace.dead = Some(DeadReason::Revoked);
+        let live_past_grace = record(now - Duration::seconds(90), Duration::seconds(60));
+        let live = record(now + Duration::minutes(5), Duration::seconds(60));
+        let kept = [dead_in_grace.session_id, live.session_id];
+        let dropped = [dead_past_grace.session_id, live_past_grace.session_id];
+        for rec in [dead_in_grace, dead_past_grace, live_past_grace, live] {
+            store.insert(rec).await.unwrap();
+        }
+        let expired_handoff = handoff(Uuid::new_v4(), now - Duration::seconds(1));
+        let expired_id = expired_handoff.handoff_id;
+        store.insert_handoff(expired_handoff, 4).await.unwrap();
+
+        assert_eq!(store.sweep(now).await.unwrap(), 2);
+        for id in kept {
+            assert!(store.get(&id).await.unwrap().is_some());
+        }
+        for id in dropped {
+            assert!(store.get(&id).await.unwrap().is_none());
+        }
+        assert!(store.take_handoff(&expired_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn children_and_accounts_are_indexed() {
+        let store = MemoryStore::new();
+        let parent = record(Utc::now() + Duration::minutes(5), Duration::zero());
+        let mut child = record(Utc::now() + Duration::minutes(5), Duration::zero());
+        child.parent = Some(parent.session_id);
+        let mut stranger = record(Utc::now() + Duration::minutes(5), Duration::zero());
+        stranger.account = "someone-else".into();
+        let (p, c) = (parent.session_id, child.session_id);
+        for rec in [parent, child, stranger] {
+            store.insert(rec).await.unwrap();
+        }
+        assert_eq!(store.children_of(&p).await.unwrap(), vec![c]);
+        let mut dev = store.ids_for_account("dev").await.unwrap();
+        dev.sort();
+        let mut expected = vec![p, c];
+        expected.sort();
+        assert_eq!(dev, expected);
+        assert_eq!(store.all_ids().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn account_epochs_count_bumps_per_account() {
+        let store = MemoryStore::new();
+        assert_eq!(store.account_epoch("dev").await.unwrap(), 0);
+        store.bump_account_epoch("dev").await.unwrap();
+        store.bump_account_epoch("dev").await.unwrap();
+        assert_eq!(store.account_epoch("dev").await.unwrap(), 2);
+        assert_eq!(store.account_epoch("other").await.unwrap(), 0);
+    }
+
+    #[test]
+    fn records_round_trip_through_json() {
+        let rec = record(Utc::now(), Duration::seconds(60));
+        let back: SessionRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back.session_id, rec.session_id);
+        assert_eq!(*back.session_key, *rec.session_key);
+        assert_eq!(
+            back.lease.expires_at.timestamp_millis(),
+            rec.lease.expires_at.timestamp_millis()
+        );
+        let h = handoff(Uuid::new_v4(), Utc::now());
+        let back: HandoffRecord =
+            serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        assert_eq!((back.handoff_id, *back.secret), (h.handoff_id, *h.secret));
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let rec = record(Utc::now(), Duration::zero());
+        let out = format!("{rec:?}");
+        assert!(out.contains("[redacted]"));
+        assert!(!out.contains("171, 171"), "session key leaked: {out}");
+        assert!(!out.contains("205, 205"), "cert hash leaked: {out}");
+        let h = handoff(Uuid::new_v4(), Utc::now());
+        let out = format!("{h:?}");
+        assert!(out.contains("[redacted]") && !out.contains("7, 7"));
     }
 }

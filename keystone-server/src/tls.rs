@@ -1,14 +1,7 @@
-//! mTLS plumbing: a rustls `ServerConfig` that can demand client
-//! certificates, and an axum-server acceptor that surfaces the peer's
-//! certificate chain to handlers.
-//!
-//! axum-server's `RustlsAcceptor` performs the handshake but discards
-//! the result — nothing reaches request extensions. `PeerCertAcceptor`
-//! wraps it: after the handshake completes it pulls the peer chain off
-//! the `TlsStream` and wraps the connection's service so every request
-//! on that connection carries a [`PeerCertificates`] extension.
+//! TLS plumbing: the rustls server config (optionally demanding client
+//! certificates) and an axum-server acceptor that attaches the peer's
+//! certificate chain to every request on the connection.
 
-use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -21,96 +14,114 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tower_service::Service;
 
+use crate::error::ServerError;
+
 /// The peer's certificate chain (leaf first), inserted into request
-/// extensions by [`PeerCertAcceptor`]. Absent entirely when the
-/// connection presented no client certificate — which, with
-/// `WebPkiClientVerifier` installed, can only happen if TLS client
-/// auth was not required.
+/// extensions by [`PeerCertAcceptor`]. Empty when the client presented none.
 #[derive(Clone, Debug)]
-pub struct PeerCertificates(pub Arc<Vec<CertificateDer<'static>>>);
+pub struct PeerCertificates(Arc<Vec<CertificateDer<'static>>>);
 
-/// sha256 of the leaf certificate's DER — the value the account file's
-/// `cert_sha256` field pins against.
-pub fn peer_cert_sha256(peers: &PeerCertificates) -> Option<[u8; 32]> {
-    peers
-        .0
-        .first()
-        .map(|leaf| Sha256::digest(leaf.as_ref()).into())
+impl PeerCertificates {
+    /// Whether the client presented no certificate.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// sha256 of the leaf certificate DER, the value sessions bind to.
+    pub fn leaf_sha256(&self) -> Option<[u8; 32]> {
+        self.0
+            .first()
+            .map(|leaf| Sha256::digest(leaf.as_ref()).into())
+    }
+
+    /// Subject common name of the leaf certificate.
+    pub fn leaf_common_name(&self) -> Option<String> {
+        let leaf = self.0.first()?;
+        let cert = webpki::EndEntityCert::try_from(leaf).ok()?;
+        subject_common_name(cert.subject())
+    }
 }
 
-/// Compare a presented cert hash against the account's pinned hash in
-/// constant time — the pin is not secret, but the comparison should
-/// not become a timing oracle for partial matches.
-pub fn cert_hash_matches(presented: &[u8; 32], pinned: &[u8; 32]) -> bool {
-    presented.ct_eq(pinned).into()
-}
-
-/// How the server will listen, decided once at startup from the TLS
-/// environment. Only `MutualTls` is a production configuration.
+/// How the server listens, decided once at startup. Only `MutualTls` is a
+/// production configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportMode {
-    /// TLS with client certificates required — the only mode that
-    /// gives the cert_sha256 account binding anything to bind to.
+    /// TLS with client certificates required and verified against `ca`.
     MutualTls {
+        /// Server certificate chain PEM.
         cert: PathBuf,
+        /// Server private key PEM.
         key: PathBuf,
+        /// Client CA certificate PEM.
         ca: PathBuf,
     },
-    /// TLS without client auth. Dev only.
-    TlsOnly { cert: PathBuf, key: PathBuf },
-    /// Cleartext HTTP. Dev only — real clients refuse it.
+    /// TLS without client authentication; development only.
+    TlsOnly {
+        /// Server certificate chain PEM.
+        cert: PathBuf,
+        /// Server private key PEM.
+        key: PathBuf,
+    },
+    /// Cleartext HTTP; development only.
     Plain,
 }
 
-/// The env var that unlocks the two insecure modes.
-pub const ALLOW_INSECURE_VAR: &str = "KEYSTONE_ALLOW_INSECURE";
-
-/// Decide the transport from `KEYSTONE_TLS_CERT` / `KEYSTONE_TLS_KEY` / `KEYSTONE_CA_CERT`;
-/// anything short of mTLS is refused unless `is_insecure_allowed`, and a half-configured cert/key
-/// pair is always refused because silently downgrading would hide the misconfiguration.
-pub fn transport_mode(
+/// Decide the transport from `KEYSTONE_TLS_CERT`, `KEYSTONE_TLS_KEY`, and
+/// `KEYSTONE_CA_CERT`. Anything short of mTLS needs `allow_insecure`; a
+/// half-configured cert/key pair is always a `Config` error.
+pub(crate) fn transport_mode(
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     ca_cert: Option<PathBuf>,
-    is_insecure_allowed: bool,
-) -> Result<TransportMode, String> {
-    let (cert, key) =
-        match (tls_cert, tls_key) {
-            (Some(cert), Some(key)) => (cert, key),
-            (None, None) => {
-                if !is_insecure_allowed {
-                    return Err(format!(
-                        "no KEYSTONE_TLS_CERT/KEYSTONE_TLS_KEY — plain HTTP is insecure; \
-                     set {ALLOW_INSECURE_VAR}=1 to run without TLS anyway"
-                    ));
-                }
-                return Ok(TransportMode::Plain);
+    allow_insecure: bool,
+) -> Result<TransportMode, ServerError> {
+    let (cert, key) = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => (cert, key),
+        (None, None) if allow_insecure => {
+            if ca_cert.is_some() {
+                return Err(ServerError::config(
+                    "KEYSTONE_CA_CERT",
+                    "set without KEYSTONE_TLS_CERT/KEYSTONE_TLS_KEY",
+                ));
             }
-            _ => return Err(
-                "KEYSTONE_TLS_CERT and KEYSTONE_TLS_KEY must be set together — refusing to start"
-                    .to_string(),
-            ),
-        };
+            return Ok(TransportMode::Plain);
+        }
+        (None, None) => {
+            return Err(ServerError::config(
+                "KEYSTONE_TLS_CERT",
+                "required unless KEYSTONE_ALLOW_INSECURE=1",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(ServerError::config(
+                "KEYSTONE_TLS_KEY",
+                "required when KEYSTONE_TLS_CERT is set",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(ServerError::config(
+                "KEYSTONE_TLS_CERT",
+                "required when KEYSTONE_TLS_KEY is set",
+            ));
+        }
+    };
     match ca_cert {
         Some(ca) => Ok(TransportMode::MutualTls { cert, key, ca }),
-        None if is_insecure_allowed => Ok(TransportMode::TlsOnly { cert, key }),
-        None => Err(format!(
-            "no KEYSTONE_CA_CERT — TLS without client certificates is insecure; \
-             set {ALLOW_INSECURE_VAR}=1 to run without mTLS anyway"
+        None if allow_insecure => Ok(TransportMode::TlsOnly { cert, key }),
+        None => Err(ServerError::config(
+            "KEYSTONE_CA_CERT",
+            "required unless KEYSTONE_ALLOW_INSECURE=1",
         )),
     }
 }
 
-/// Build the server's TLS config from PEM files.
-///
-/// `ca_cert_pem` — when `Some`, client certificates are REQUIRED and
-/// verified against this CA root (mTLS). When `None`, no client auth
-/// is requested — dev mode only.
+/// Build the server TLS config from PEM bytes. With `ca_cert_pem`, client
+/// certificates are required and verified against it; without, no client
+/// authentication is requested.
 pub fn load_rustls_config(
     cert_pem: &[u8],
     key_pem: &[u8],
@@ -134,9 +145,7 @@ pub fn load_rustls_config(
             )
         })?;
 
-    // Explicit provider: the workspace enables both ring and
-    // aws-lc-rs on rustls (via reqwest and axum-server), so the
-    // crate-feature default is ambiguous and `builder()` would panic.
+    // Explicit provider: the process may link more than one rustls provider.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -174,22 +183,20 @@ pub fn load_rustls_config(
     let mut config = builder
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    // axum-server does not set ALPN itself; without it hyper falls back
-    // to http/1.1 anyway, but declaring it keeps h2-capable clients
-    // honest about what this server speaks.
+    // Declared so h2-capable clients do not try to negotiate h2.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(RustlsConfig::from_config(Arc::new(config)))
 }
 
-/// An [`Accept`] that runs the rustls handshake via [`RustlsAcceptor`],
-/// then attaches the peer certificate chain to every request the
-/// connection's service sees.
+/// An [`Accept`] that runs the rustls handshake, then attaches the peer
+/// certificate chain to every request on the connection.
 #[derive(Clone)]
 pub struct PeerCertAcceptor {
     inner: RustlsAcceptor,
 }
 
 impl PeerCertAcceptor {
+    /// Wrap a rustls config.
     pub fn new(config: RustlsConfig) -> Self {
         Self {
             inner: RustlsAcceptor::new(config),
@@ -210,9 +217,7 @@ where
         let future = self.inner.accept(stream, service);
         Box::pin(async move {
             let (stream, service) = future.await?;
-            // The handshake already ran inside the acceptor; the peer
-            // chain is a property of the connection, so it is captured
-            // once here rather than per request.
+            // The chain is a property of the connection: capture it once.
             let peers = stream
                 .get_ref()
                 .1
@@ -230,9 +235,8 @@ where
     }
 }
 
-/// Per-connection service wrapper: stamps the peer cert chain onto
-/// each request's extensions so handlers can bind accounts to the
-/// certificate that carried them.
+/// Per-connection service wrapper that stamps [`PeerCertificates`] onto
+/// each request's extensions.
 #[derive(Clone)]
 pub struct PeerCertService<S> {
     inner: S,
@@ -257,14 +261,10 @@ where
     }
 }
 
-/// Extract the Common Name from a DER-encoded X.501 Name (the cert's
-/// `subject` field). Returns `None` when no CN RDN is present or the
-/// value isn't a decodable string.
-///
-/// Hand-rolled DER walk: pulling in a full X.509 parser just to read
-/// one attribute is not worth the dependency. Only the tags rcgen and
-/// real CAs actually emit for CN values are decoded.
-pub fn subject_common_name(subject_der: &[u8]) -> Option<String> {
+/// The common name in the contents of a DER X.501 Name (the RDN sequence
+/// without its outer SEQUENCE, as webpki returns a certificate subject), or
+/// `None` when no CN is present or its string type is not supported.
+fn subject_common_name(rdn_sequence: &[u8]) -> Option<String> {
     /// One DER TLV: returns (tag, content, rest).
     fn tlv(der: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         let (&tag, rest) = der.split_first()?;
@@ -290,13 +290,7 @@ pub fn subject_common_name(subject_der: &[u8]) -> Option<String> {
 
     const CN_OID: &[u8] = &[0x55, 0x04, 0x03]; // id-at-commonName 2.5.4.3
 
-    // webpki's `Cert::subject()` hands back the Name's contents — the
-    // RDNs without the outer SEQUENCE. Accept a wrapped SEQUENCE too
-    // so the helper works on either form.
-    let mut rdns = match tlv(subject_der) {
-        Some((0x30, inner, [])) => inner,
-        _ => subject_der,
-    };
+    let mut rdns = rdn_sequence;
     while !rdns.is_empty() {
         let (tag, rdn, rest) = tlv(rdns)?;
         rdns = rest;
@@ -316,10 +310,8 @@ pub fn subject_common_name(subject_der: &[u8]) -> Option<String> {
             }
             let (val_tag, val, _) = tlv(atv_rest)?;
             return match val_tag {
-                // UTF8String / PrintableString / IA5String / T61String
-                // (T61 treated as Latin-1 — CN values are ASCII in
-                // practice and this only feeds an equality check).
-                0x0c | 0x13 | 0x16 | 0x14 => Some(String::from_utf8_lossy(val).into_owned()),
+                // UTF8/Printable/IA5/T61 strings; invalid UTF-8 yields no name, never a lossy one.
+                0x0c | 0x13 | 0x16 | 0x14 => String::from_utf8(val.to_vec()).ok(),
                 // BMPString is UTF-16BE.
                 0x1e => {
                     let units: Vec<u16> = val

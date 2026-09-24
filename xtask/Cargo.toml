@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 keystone-core = { path = "../keystone-core" }
@@ -14,11 +15,9 @@ hex = "0.4"
 rand = "0.8"
 rpassword = "7"
 rcgen = { version = "0.13", features = ["x509-parser"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = "0.103"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
-
-[dev-dependencies]
-base64 = "0.22"
-
+zeroize = "1"

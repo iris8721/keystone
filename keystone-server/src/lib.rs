@@ -1,19 +1,36 @@
-//! keystone-server — the authority half of the Keystone system.
+//! keystone-server: the authority half of keystone. Every decision about
+//! whether protected operations may run is made here; clients only hold
+//! signed, expiring evidence of it.
 //!
-//! Hosts the exchange/attest/heartbeat/revoke endpoints from README.
-//! Every check that decides whether protected operations may run lives
-//! here; clients and applications only ever hold signed, expiring
-//! evidence of a decision this server made.
+//! Embedders build an [`AppState`] and either call [`serve()`] or mount
+//! [`public_router`] / [`admin_router`] themselves (see their docs for the
+//! connection requirements, and call [`AppState::sweep`] on a timer).
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod accounts;
-pub mod downloads;
+pub mod audit;
+pub mod config;
+pub(crate) mod downloads;
 pub mod entitlement;
+pub mod error;
+pub mod limiter;
+pub mod revocations;
 pub mod routes;
-pub mod runtime;
+pub mod serve;
 pub mod state;
 pub mod store;
 pub mod tls;
 
-pub use routes::build_router;
-pub use state::AppState;
-pub use store::SessionStore;
+pub use audit::{AuditEvent, AuditSink, TracingAudit};
+pub use config::{AdminToken, AdminTokenError, PayloadConfig, RateLimits, ServerConfig};
+pub use error::ServerError;
+pub use keystone_core::BackendError;
+pub use limiter::{MemoryLimiter, RateLimiter};
+pub use revocations::{FileRevocationStore, MemoryRevocations, RevocationStore};
+pub use routes::{admin_router, public_router};
+pub use serve::{Listeners, serve};
+pub use state::{AppState, AppStateBuilder};
+pub use store::{HandoffRecord, MemoryStore, SessionRecord, SessionStore};
+pub use tls::TransportMode;

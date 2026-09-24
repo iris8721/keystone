@@ -8,18 +8,20 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::KeystoneError;
+use crate::error::BackendError;
 
 /// A product grant attached to an account. Expiry is absolute — an
 /// expired entitlement authorizes nothing even if the credentials that
 /// fetched it are still valid, and sessions must not outlive it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entitlement {
+    /// Account holding the grant.
     pub account: String,
+    /// Product granted.
     pub product: String,
+    /// First instant at which the grant is dead.
     pub expires_at: DateTime<Utc>,
-    /// Feature names the grant covers — the payload consumes these as
-    /// per-feature grant tokens at runtime.
+    /// Feature names the grant covers.
     pub features: Vec<String>,
 }
 
@@ -28,44 +30,32 @@ pub struct Entitlement {
 /// still authenticates, then fails authorization on the product check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountIdentity {
+    /// The authenticated account name.
     pub account: String,
 }
 
-/// Where entitlement records come from. The production source is the
-/// local accounts file (`keystone-server::accounts::LocalAccounts`); the
-/// server ships a stub for development.
-///
-/// `Ok(None)` from either method means "no such record" — bad
-/// credentials or no grant. `Err` is reserved for backend failures,
-/// which fail closed but must be logged distinctly from ordinary
-/// denials: a down backend is an outage, not an attack.
+/// Where accounts and grants come from. `Ok(None)` means no such record
+/// (bad credentials or no grant); `Err` is a backend outage, which callers
+/// fail closed on and report distinctly from a denial.
 #[async_trait]
 pub trait EntitlementSource: Send + Sync {
-    /// Prove the account/secret pair. `None` on bad credentials — a
-    /// failed login is not a backend error.
+    /// Prove the account/secret pair; `None` on bad credentials.
     async fn authenticate(
         &self,
         account: &str,
         secret: &str,
-    ) -> Result<Option<AccountIdentity>, KeystoneError>;
+    ) -> Result<Option<AccountIdentity>, BackendError>;
 
-    /// Fetch the account's grant for a specific product. `None` means
-    /// the account exists but holds no grant for `product`.
+    /// The account's grant for `product`; `None` when it holds none.
     async fn entitlement(
         &self,
         account: &str,
         product: &str,
-    ) -> Result<Option<Entitlement>, KeystoneError>;
+    ) -> Result<Option<Entitlement>, BackendError>;
 
-    /// sha256 of the DER of the client certificate bound to this
-    /// account, if any. When `Some`, the transport must have presented
-    /// exactly that certificate — the account file's `cert_sha256`
-    /// field pins the install, not just the CA. `None` means any
-    /// CA-issued client cert authenticates the install.
-    ///
-    /// Default returns `None` so sources without cert binding (the dev
-    /// stub, tests) compile unchanged.
-    async fn cert_sha256(&self, _account: &str) -> Result<Option<[u8; 32]>, KeystoneError> {
+    /// sha256 of the client certificate DER the account is pinned to, if
+    /// any. Defaults to `None` (no pin).
+    async fn cert_sha256(&self, _account: &str) -> Result<Option<[u8; 32]>, BackendError> {
         Ok(None)
     }
 }

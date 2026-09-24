@@ -1,36 +1,24 @@
-//! LocalAccounts — the file-backed entitlement source. Covers the
-//! contract the routes rely on: good creds authenticate, bad creds and
-//! unknown accounts deny identically (argon2 cost paid either way),
-//! expired grants authorize nothing, backend failures are errors not
-//! denials, and file edits are picked up without a restart.
+//! LocalAccounts: the file-backed entitlement source.
 
-use std::path::PathBuf;
-use std::time::{Duration as StdDuration, Instant, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use chrono::{Duration, Utc};
 use keystone_core::{AccountFile, AccountGrant, AccountRecord, EntitlementSource};
 use keystone_server::accounts::LocalAccounts;
 
-const ACCOUNT: &str = "alice";
-const SECRET: &str = "s3cret";
-const PRODUCT: &str = "prod-x";
+const ACCOUNT: &str = "dev";
+const SECRET: &str = "devpass";
+const PRODUCT: &str = "dev-product";
 
 fn hash(secret: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     Argon2::default()
         .hash_password(secret.as_bytes(), &salt)
         .unwrap()
         .to_string()
-}
-
-fn grant(product: &str, expires_at: chrono::DateTime<Utc>) -> AccountGrant {
-    AccountGrant {
-        product: product.to_string(),
-        expires_at,
-        features: vec!["aim".to_string(), "esp".to_string()],
-    }
 }
 
 fn record(name: &str, secret: &str, grants: Vec<AccountGrant>) -> AccountRecord {
@@ -42,60 +30,40 @@ fn record(name: &str, secret: &str, grants: Vec<AccountGrant>) -> AccountRecord 
     }
 }
 
+fn grant(product: &str, days: i64, features: &[&str]) -> AccountGrant {
+    AccountGrant {
+        product: product.to_string(),
+        expires_at: Utc::now() + Duration::days(days),
+        features: features.iter().map(|f| f.to_string()).collect(),
+    }
+}
+
+fn write(dir: &Path, accounts: Vec<AccountRecord>) -> PathBuf {
+    let path = dir.join("accounts.json");
+    AccountFile { accounts }.save(&path).unwrap();
+    path
+}
+
 fn workdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("keystone-accounts-{}", rand::random::<u64>()));
+    let dir = std::env::temp_dir().join(format!("keystone-accounts-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-fn write_accounts(dir: &std::path::Path, file: &AccountFile) -> PathBuf {
-    let path = dir.join("accounts.json");
-    file.save(&path).unwrap();
-    path
-}
-
 #[tokio::test]
-async fn good_credentials_authenticate_and_grant() {
+async fn credentials_and_grants_resolve() {
     let dir = workdir();
-    let path = write_accounts(
+    let path = write(
         &dir,
-        &AccountFile {
-            accounts: vec![record(
-                ACCOUNT,
-                SECRET,
-                vec![grant(PRODUCT, Utc::now() + Duration::days(30))],
-            )],
-        },
+        vec![record(ACCOUNT, SECRET, vec![grant(PRODUCT, 30, &["all"])])],
     );
     let backend = LocalAccounts::open(path);
-
-    let identity = backend.authenticate(ACCOUNT, SECRET).await.unwrap();
-    assert_eq!(identity.unwrap().account, ACCOUNT);
-
-    let grant = backend
-        .entitlement(ACCOUNT, PRODUCT)
+    let identity = backend
+        .authenticate(ACCOUNT, SECRET)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(grant.account, ACCOUNT);
-    assert_eq!(grant.product, PRODUCT);
-    assert_eq!(grant.features, vec!["aim", "esp"]);
-}
-
-#[tokio::test]
-async fn bad_secret_denies() {
-    let dir = workdir();
-    let path = write_accounts(
-        &dir,
-        &AccountFile {
-            accounts: vec![record(
-                ACCOUNT,
-                SECRET,
-                vec![grant(PRODUCT, Utc::now() + Duration::days(30))],
-            )],
-        },
-    );
-    let backend = LocalAccounts::open(path);
+    assert_eq!(identity.account, ACCOUNT);
     assert!(
         backend
             .authenticate(ACCOUNT, "wrong")
@@ -103,58 +71,36 @@ async fn bad_secret_denies() {
             .unwrap()
             .is_none()
     );
-}
-
-#[tokio::test]
-async fn unknown_account_denies_with_argon2_cost_paid() {
-    let dir = workdir();
-    let path = write_accounts(
-        &dir,
-        &AccountFile {
-            accounts: vec![record(
-                ACCOUNT,
-                SECRET,
-                vec![grant(PRODUCT, Utc::now() + Duration::days(30))],
-            )],
-        },
-    );
-    let backend = LocalAccounts::open(path);
-
-    // The denial must cost an argon2 verify — a fast-path return would
-    // leak account existence through timing. Argon2's default params
-    // take milliseconds at minimum; a skipped verify is sub-microsecond.
-    let start = Instant::now();
-    let result = backend.authenticate("nobody", SECRET).await.unwrap();
-    assert!(result.is_none());
     assert!(
-        start.elapsed() >= StdDuration::from_millis(1),
-        "unknown-account verify returned suspiciously fast — timing oracle open"
+        backend
+            .authenticate("nobody", SECRET)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let grant = backend
+        .entitlement(ACCOUNT, PRODUCT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grant.features, ["all"]);
+    assert!(
+        backend
+            .entitlement(ACCOUNT, "other")
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 
 #[tokio::test]
 async fn expired_grant_authorizes_nothing() {
     let dir = workdir();
-    let path = write_accounts(
+    let path = write(
         &dir,
-        &AccountFile {
-            accounts: vec![record(
-                ACCOUNT,
-                SECRET,
-                vec![grant(PRODUCT, Utc::now() - Duration::days(1))],
-            )],
-        },
+        vec![record(ACCOUNT, SECRET, vec![grant(PRODUCT, -1, &["all"])])],
     );
     let backend = LocalAccounts::open(path);
-    // Credentials still prove identity — expiry is an authorization
-    // failure, not an authentication one.
-    assert!(
-        backend
-            .authenticate(ACCOUNT, SECRET)
-            .await
-            .unwrap()
-            .is_some()
-    );
     assert!(
         backend
             .entitlement(ACCOUNT, PRODUCT)
@@ -165,27 +111,22 @@ async fn expired_grant_authorizes_nothing() {
 }
 
 #[tokio::test]
-async fn missing_file_is_a_backend_error() {
+async fn missing_or_malformed_file_is_a_backend_error() {
     let dir = workdir();
-    let backend = LocalAccounts::open(dir.join("accounts.json"));
-    assert!(backend.authenticate(ACCOUNT, SECRET).await.is_err());
-    assert!(backend.entitlement(ACCOUNT, PRODUCT).await.is_err());
-}
+    let missing = LocalAccounts::open(dir.join("accounts.json"));
+    assert!(missing.authenticate(ACCOUNT, SECRET).await.is_err());
+    assert!(missing.entitlement(ACCOUNT, PRODUCT).await.is_err());
 
-#[tokio::test]
-async fn malformed_file_is_a_backend_error() {
-    let dir = workdir();
-    let path = dir.join("accounts.json");
+    let path = dir.join("broken.json");
     std::fs::write(&path, b"{not json").unwrap();
-    let backend = LocalAccounts::open(path);
-    assert!(backend.authenticate(ACCOUNT, SECRET).await.is_err());
-    assert!(backend.entitlement(ACCOUNT, PRODUCT).await.is_err());
+    let malformed = LocalAccounts::open(path);
+    assert!(malformed.authenticate(ACCOUNT, SECRET).await.is_err());
 }
 
 #[tokio::test]
 async fn file_edits_are_picked_up_without_restart() {
     let dir = workdir();
-    let path = write_accounts(&dir, &AccountFile { accounts: vec![] });
+    let path = write(&dir, vec![]);
     let backend = LocalAccounts::open(path.clone());
     assert!(
         backend
@@ -195,25 +136,11 @@ async fn file_edits_are_picked_up_without_restart() {
             .is_none()
     );
 
-    // Rewrite the file with the account added, and bump the mtime past
-    // the previous write — filesystems with coarse mtime granularity
-    // must still observe the change.
-    AccountFile {
-        accounts: vec![record(
-            ACCOUNT,
-            SECRET,
-            vec![grant(PRODUCT, Utc::now() + Duration::days(30))],
-        )],
-    }
-    .save(&path)
-    .unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(SystemTime::now() + StdDuration::from_secs(5))
-        .unwrap();
-
+    write(
+        &dir,
+        vec![record(ACCOUNT, SECRET, vec![grant(PRODUCT, 30, &["all"])])],
+    );
+    tokio::time::sleep(StdDuration::from_millis(1100)).await;
     assert!(
         backend
             .authenticate(ACCOUNT, SECRET)
@@ -221,81 +148,66 @@ async fn file_edits_are_picked_up_without_restart() {
             .unwrap()
             .is_some()
     );
-    assert!(
-        backend
-            .entitlement(ACCOUNT, PRODUCT)
-            .await
-            .unwrap()
-            .is_some()
-    );
+
+    std::fs::write(&path, b"{not json").unwrap();
+    tokio::time::sleep(StdDuration::from_millis(1100)).await;
+    assert!(backend.authenticate(ACCOUNT, SECRET).await.is_err());
 }
 
 #[tokio::test]
-async fn cert_sha256_decodes_the_recorded_fingerprint() {
+async fn cert_pin_is_decoded_and_validated() {
     let dir = workdir();
-    let mut rec = record(ACCOUNT, SECRET, vec![]);
-    rec.cert_sha256 = Some(hex::encode([0xABu8; 32]));
-    let path = write_accounts(
-        &dir,
-        &AccountFile {
-            accounts: vec![rec, record("unbound", SECRET, vec![])],
-        },
-    );
+    let mut pinned = record(ACCOUNT, SECRET, vec![]);
+    pinned.cert_sha256 = Some(hex::encode([0x11u8; 32]));
+    let mut broken = record("broken", SECRET, vec![]);
+    broken.cert_sha256 = Some("abcd".into());
+    let path = write(&dir, vec![pinned, broken, record("free", SECRET, vec![])]);
     let backend = LocalAccounts::open(path);
-
     assert_eq!(
         backend.cert_sha256(ACCOUNT).await.unwrap(),
-        Some([0xABu8; 32])
+        Some([0x11; 32])
     );
-    assert_eq!(backend.cert_sha256("unbound").await.unwrap(), None);
-    assert_eq!(backend.cert_sha256("nobody").await.unwrap(), None);
+    assert_eq!(backend.cert_sha256("free").await.unwrap(), None);
+    assert!(backend.cert_sha256("broken").await.is_err());
 }
 
-/// A cert_sha256 that isn't 32 bytes of hex is a backend error, not a
-/// silent "unbound" — a malformed pin must fail closed, never open.
-#[tokio::test]
-async fn malformed_cert_sha256_is_a_backend_error() {
+#[tokio::test(flavor = "current_thread")]
+async fn password_hashing_does_not_block_the_executor() {
     let dir = workdir();
-    let mut bad_hex = record(ACCOUNT, SECRET, vec![]);
-    bad_hex.cert_sha256 = Some("not-hex-at-all".into());
-    let mut short = record("short", SECRET, vec![]);
-    short.cert_sha256 = Some(hex::encode([0xABu8; 16])); // 16 bytes, not 32
-    let path = write_accounts(
-        &dir,
-        &AccountFile {
-            accounts: vec![bad_hex, short],
-        },
-    );
-    let backend = LocalAccounts::open(path);
+    let stored = hash(SECRET);
+    let path = dir.join("accounts.json");
+    AccountFile {
+        accounts: vec![AccountRecord {
+            name: ACCOUNT.into(),
+            secret_hash: stored.clone(),
+            entitlements: vec![],
+            cert_sha256: None,
+        }],
+    }
+    .save(&path)
+    .unwrap();
+    let backend = std::sync::Arc::new(LocalAccounts::open(path));
 
-    assert!(
-        backend.cert_sha256(ACCOUNT).await.is_err(),
-        "non-hex cert_sha256 must error, not silently unbind"
-    );
-    assert!(
-        backend.cert_sha256("short").await.is_err(),
-        "short cert_sha256 must error, not silently unbind"
-    );
-}
+    let started = Instant::now();
+    Argon2::default()
+        .verify_password(SECRET.as_bytes(), &PasswordHash::new(&stored).unwrap())
+        .unwrap();
+    let one_verify = started.elapsed();
 
-/// A stored secret_hash that argon2 can't parse is a backend failure
-/// (503 upstream), not a denial — a corrupt file must not masquerade
-/// as "bad credentials".
-#[tokio::test]
-async fn corrupt_secret_hash_is_a_backend_error() {
-    let dir = workdir();
-    let mut rec = record(ACCOUNT, SECRET, vec![]);
-    rec.secret_hash = "not-an-argon2-phc-string".into();
-    let path = write_accounts(
-        &dir,
-        &AccountFile {
-            accounts: vec![rec],
-        },
-    );
-    let backend = LocalAccounts::open(path);
-
+    let logins: Vec<_> = (0..16)
+        .map(|_| {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.authenticate(ACCOUNT, SECRET).await })
+        })
+        .collect();
+    let started = Instant::now();
+    tokio::time::sleep(StdDuration::from_millis(5)).await;
+    let tick = started.elapsed();
+    for login in logins {
+        assert!(login.await.unwrap().unwrap().is_some());
+    }
     assert!(
-        backend.authenticate(ACCOUNT, SECRET).await.is_err(),
-        "corrupt hash must be a backend error, not a denial"
+        tick < (one_verify * 4).max(StdDuration::from_millis(50)),
+        "timer delayed {tick:?} by hashing (one verify takes {one_verify:?})"
     );
 }

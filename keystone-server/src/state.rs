@@ -1,238 +1,446 @@
-//! Shared application state threaded into every handler.
+//! Shared application state and its builder.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration as StdDuration, Instant, SystemTime};
+use std::sync::Arc;
 
-use chrono::Duration;
-use keystone_core::{EntitlementSource, Issuer};
+use chrono::{DateTime, Duration, Utc};
+use keystone_core::{BackendError, DeadReason, EntitlementSource, Issuer};
+use parking_lot::{Mutex, RwLock};
+use uuid::Uuid;
 
+use crate::accounts::SecretVerifier;
+use crate::audit::{AuditEvent, AuditSink, TracingAudit};
+use crate::config::{AdminToken, PayloadConfig, RateLimits};
 use crate::downloads::DownloadLog;
-use crate::store::SessionStore;
+use crate::error::ServerError;
+use crate::limiter::{MemoryLimiter, RateLimiter};
+use crate::revocations::{MemoryRevocations, RevocationStore};
+use crate::store::{MemoryStore, SessionStore};
 
-/// Everything a handler needs. Cloning shares the same issuer, store,
-/// and entitlement backend — axum clones state per request.
+/// How long a different HWID for the same account counts as an anomaly.
+const HWID_WINDOW: Duration = Duration::minutes(10);
+/// Bounded retries for a compare-and-swap that keeps losing.
+pub(crate) const CAS_ATTEMPTS: usize = 16;
+
+/// Last HWID hash an account presented, and when.
+type Sighting = ([u8; 32], DateTime<Utc>);
+
+/// Everything the routes share. Cheap to clone.
 #[derive(Clone)]
 pub struct AppState {
-    /// The signing key behind every envelope. Wrapped in Arc because
-    /// Issuer is not Clone and must never be duplicated per-request.
-    pub issuer: Arc<Issuer>,
-    pub store: SessionStore,
-    pub entitlements: Arc<dyn EntitlementSource>,
-    /// sha256 of KEYSTONE_ADMIN_TOKEN. Stored hashed so the raw token
-    /// never sits in process memory beyond startup; `None` means
-    /// /revoke is closed entirely.
-    pub admin_token_hash: Option<[u8; 32]>,
-    /// Lease lifetime per grant/renewal. Short on purpose: a lease is
-    /// the only thing keeping protected operations alive.
-    pub lease_ttl: Duration,
-    /// Bounded tolerance for transient failure. Fixed at first failure;
-    /// retries never extend it.
-    pub grace_period: Duration,
-    /// Directory holding released payload blobs as
-    /// `{product}-{version}.bin` (KEYSTONE_PAYLOAD_DIR). `None` means
-    /// the payload routes are closed entirely — a server that cannot
-    /// serve artifacts must say so (503), not improvise.
-    pub payload_dir: Option<std::path::PathBuf>,
-    /// Server-held secret the artifact keys derive from
-    /// (KEYSTONE_PAYLOAD_SECRET / KEYSTONE_PAYLOAD_SECRET_FILE). The
-    /// sealed blobs are useless without it; it never leaves the server.
-    pub payload_secret: Option<[u8; 32]>,
-    /// Rotation counter mixed into every artifact key derivation
-    /// (KEYSTONE_PAYLOAD_EPOCH, default 0). Bumping it re-keys every
-    /// artifact without changing the secret; `xtask seal` must use the
-    /// same value or nothing unseals.
-    pub payload_epoch: u32,
-    /// Pseudonymous download records (KEYSTONE_DOWNLOAD_LOG, default
-    /// `downloads.jsonl` inside the payload dir; pseudonym secret is
-    /// KEYSTONE_WATERMARK_SECRET, falling back to the payload secret).
-    /// `None` means logging is disabled — downloads still serve, they
-    /// just leave no trail.
-    pub downloads: Option<DownloadLog>,
-    /// HMAC key for per-request manifest `download_id` stamps
-    /// (KEYSTONE_WATERMARK_SECRET, falling back to the payload
-    /// secret). `None` leaves download_id empty — manifests still
-    /// verify, they just aren't attributable to one download.
-    pub watermark_secret: Option<[u8; 32]>,
-    /// Sliding-window rate limits per route.
-    pub rate_limits: RateLimits,
-    pub rate_limiter: Arc<RateLimiter>,
-    /// Plaintext-hash cache for sealed artifacts — see the type.
-    pub artifact_hashes: Arc<ArtifactHashes>,
-    /// Issuer key ids this server has declared compromised
-    /// (KEYSTONE_REVOKED_KEY_IDS, plus anything /revoke adds at
-    /// runtime). Shipped to clients in every exchange and lease body
-    /// so a leaked key stops verifying without a rebuild.
-    pub revoked_key_ids: Arc<RwLock<BTreeSet<u8>>>,
+    pub(crate) inner: Arc<Inner>,
+}
+
+pub(crate) struct Inner {
+    pub(crate) issuer: Issuer,
+    pub(crate) entitlements: Arc<dyn EntitlementSource>,
+    pub(crate) store: Arc<dyn SessionStore>,
+    pub(crate) limiter: Arc<dyn RateLimiter>,
+    pub(crate) revocations: Arc<dyn RevocationStore>,
+    pub(crate) audit: Arc<dyn AuditSink>,
+    pub(crate) lease_ttl: Duration,
+    pub(crate) grace_period: Duration,
+    pub(crate) rate_limits: RateLimits,
+    pub(crate) admin_token: Option<AdminToken>,
+    pub(crate) admin_certificates: BTreeSet<[u8; 32]>,
+    pub(crate) require_client_certificates: bool,
+    pub(crate) payloads: Option<PayloadConfig>,
+    pub(crate) downloads: Option<DownloadLog>,
+    pub(crate) verifier: SecretVerifier,
+    pub(crate) publish: tokio::sync::Mutex<()>,
+    revoked_key_ids: RwLock<BTreeSet<u8>>,
+    key_revocation: tokio::sync::Mutex<()>,
+    fingerprints: Mutex<HashMap<String, Sighting>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("key_id", &self.inner.issuer.key_id())
+            .field("lease_ttl", &self.inner.lease_ttl)
+            .field("grace_period", &self.inner.grace_period)
+            .field("rate_limits", &self.inner.rate_limits)
+            .field(
+                "require_client_certificates",
+                &self.inner.require_client_certificates,
+            )
+            .field("payloads", &self.inner.payloads)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configures an [`AppState`]. Defaults: [`MemoryStore`], [`MemoryLimiter`],
+/// [`MemoryRevocations`], [`TracingAudit`], 300 s leases, 60 s grace,
+/// default rate limits, no admin token or allow-list, client certificates
+/// optional, no payloads.
+pub struct AppStateBuilder {
+    issuer: Issuer,
+    entitlements: Arc<dyn EntitlementSource>,
+    store: Option<Arc<dyn SessionStore>>,
+    limiter: Option<Arc<dyn RateLimiter>>,
+    revocations: Option<Arc<dyn RevocationStore>>,
+    audit: Option<Arc<dyn AuditSink>>,
+    lease_ttl: Duration,
+    grace_period: Duration,
+    rate_limits: RateLimits,
+    admin_token: Option<AdminToken>,
+    admin_certificates: BTreeSet<[u8; 32]>,
+    require_client_certificates: bool,
+    payloads: Option<PayloadConfig>,
+    download_log: Option<PathBuf>,
+    revoked_key_ids: BTreeSet<u8>,
+}
+
+impl std::fmt::Debug for AppStateBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppStateBuilder")
+            .field("key_id", &self.issuer.key_id())
+            .field("lease_ttl", &self.lease_ttl)
+            .field("grace_period", &self.grace_period)
+            .field("rate_limits", &self.rate_limits)
+            .field("admin_token", &self.admin_token)
+            .field("admin_certificates", &self.admin_certificates.len())
+            .field(
+                "require_client_certificates",
+                &self.require_client_certificates,
+            )
+            .field("payloads", &self.payloads)
+            .field("download_log", &self.download_log)
+            .field("revoked_key_ids", &self.revoked_key_ids)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppStateBuilder {
+    /// Session storage.
+    pub fn session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Rate limiter.
+    pub fn rate_limiter(mut self, limiter: Arc<dyn RateLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    /// Durable store for revoked key ids; loaded by [`Self::build`].
+    pub fn revocations(mut self, revocations: Arc<dyn RevocationStore>) -> Self {
+        self.revocations = Some(revocations);
+        self
+    }
+
+    /// Audit sink.
+    pub fn audit(mut self, audit: Arc<dyn AuditSink>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Lease lifetime per grant or renewal; must be positive.
+    pub fn lease_ttl(mut self, ttl: Duration) -> Self {
+        self.lease_ttl = ttl;
+        self
+    }
+
+    /// Grace a client may run on after a transient failure; must not be negative.
+    pub fn grace_period(mut self, grace: Duration) -> Self {
+        self.grace_period = grace;
+        self
+    }
+
+    /// Per-minute ceilings.
+    pub fn rate_limits(mut self, limits: RateLimits) -> Self {
+        self.rate_limits = limits;
+        self
+    }
+
+    /// Credential for the admin router; without one every admin request is
+    /// 403 `forbidden`.
+    pub fn admin_token(mut self, token: AdminToken) -> Self {
+        self.admin_token = Some(token);
+        self
+    }
+
+    /// sha256 of the leaf certificates allowed on the admin router. When
+    /// non-empty, any other certificate (or none) is 403 `forbidden`.
+    pub fn admin_certificates(mut self, hashes: BTreeSet<[u8; 32]>) -> Self {
+        self.admin_certificates = hashes;
+        self
+    }
+
+    /// Whether every request must carry client certificates (as attached by
+    /// [`crate::tls::PeerCertAcceptor`]); a request without them is refused
+    /// with 500 instead of being served unbound.
+    pub fn require_client_certificates(mut self, required: bool) -> Self {
+        self.require_client_certificates = required;
+        self
+    }
+
+    /// Enable the payload routes and artifact publishing.
+    pub fn payloads(mut self, payloads: PayloadConfig) -> Self {
+        self.payloads = Some(payloads);
+        self
+    }
+
+    /// Append download records to `path`; requires [`Self::payloads`].
+    pub fn download_log(mut self, path: PathBuf) -> Self {
+        self.download_log = Some(path);
+        self
+    }
+
+    /// Issuer key ids revoked in addition to what the revocation store holds.
+    pub fn revoked_key_ids(mut self, ids: BTreeSet<u8>) -> Self {
+        self.revoked_key_ids = ids;
+        self
+    }
+
+    /// Load revocations and open the download log. Fails with
+    /// [`ServerError::ActiveKeyRevoked`] when the issuer's own key id is
+    /// revoked, and with `Config` naming the builder method for an invalid
+    /// setting (including an admin token with required client certificates
+    /// but no `admin_certificates`).
+    pub async fn build(self) -> Result<AppState, ServerError> {
+        if self.lease_ttl <= Duration::zero() {
+            return Err(ServerError::config("lease_ttl", "must be positive"));
+        }
+        if self.grace_period < Duration::zero() {
+            return Err(ServerError::config("grace_period", "must not be negative"));
+        }
+        if self.rate_limits.window.is_zero() {
+            return Err(ServerError::config(
+                "rate_limits",
+                "window must be positive",
+            ));
+        }
+        if self.admin_token.is_some()
+            && self.require_client_certificates
+            && self.admin_certificates.is_empty()
+        {
+            return Err(ServerError::config(
+                "admin_certificates",
+                "required with an admin token when client certificates are required",
+            ));
+        }
+        let revocations = self
+            .revocations
+            .unwrap_or_else(|| Arc::new(MemoryRevocations::new()));
+        let mut revoked = self.revoked_key_ids;
+        revoked.extend(revocations.load().await.map_err(ServerError::Revocations)?);
+        if revoked.contains(&self.issuer.key_id()) {
+            return Err(ServerError::ActiveKeyRevoked(self.issuer.key_id()));
+        }
+        let downloads = match (&self.download_log, &self.payloads) {
+            (Some(path), Some(payloads)) => Some(
+                DownloadLog::open(path, &payloads.watermark_secret).map_err(|e| {
+                    ServerError::config("download_log", format!("{}: {e}", path.display()))
+                })?,
+            ),
+            (Some(_), None) => {
+                return Err(ServerError::config("download_log", "requires payloads"));
+            }
+            (None, _) => None,
+        };
+        Ok(AppState {
+            inner: Arc::new(Inner {
+                issuer: self.issuer,
+                entitlements: self.entitlements,
+                store: self.store.unwrap_or_else(|| Arc::new(MemoryStore::new())),
+                limiter: self
+                    .limiter
+                    .unwrap_or_else(|| Arc::new(MemoryLimiter::new())),
+                revocations,
+                audit: self.audit.unwrap_or_else(|| Arc::new(TracingAudit)),
+                lease_ttl: self.lease_ttl,
+                grace_period: self.grace_period,
+                rate_limits: self.rate_limits,
+                admin_token: self.admin_token,
+                admin_certificates: self.admin_certificates,
+                require_client_certificates: self.require_client_certificates,
+                payloads: self.payloads,
+                downloads,
+                verifier: SecretVerifier::new(),
+                publish: tokio::sync::Mutex::new(()),
+                revoked_key_ids: RwLock::new(revoked),
+                key_revocation: tokio::sync::Mutex::new(()),
+                fingerprints: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
 }
 
 impl AppState {
-    /// Snapshot of the revoked issuer ids, ascending — what every
-    /// grant body carries to the client.
-    pub fn revoked_key_ids_snapshot(&self) -> Vec<u8> {
-        self.revoked_key_ids
-            .read()
-            .expect("revoked key set poisoned")
-            .iter()
-            .copied()
-            .collect()
-    }
-
-    /// Declare an issuer key compromised. Returns false when it was
-    /// already revoked.
-    pub fn revoke_key_id(&self, key_id: u8) -> bool {
-        self.revoked_key_ids
-            .write()
-            .expect("revoked key set poisoned")
-            .insert(key_id)
-    }
-}
-
-/// Per-route sliding-window limits. Configured once at startup; tests
-/// shrink them to exercise the 429 path without a real burst.
-#[derive(Debug, Clone, Copy)]
-pub struct RateLimits {
-    /// /exchange per source IP — argon2 makes each attempt expensive,
-    /// but an unbounded flood still costs CPU per request.
-    pub exchange_per_ip: u32,
-    /// /exchange per account — credential stuffing against one account
-    /// from rotating IPs must still hit a wall.
-    pub exchange_per_account: u32,
-    /// /revoke per source IP — admin-gated anyway; the limit keeps a
-    /// token-guessing flood from being free.
-    pub revoke_per_ip: u32,
-    /// /attest per session — a session_id is enough to drive the
-    /// route, so a captured one must not buy an unbounded MAC oracle.
-    pub attest_per_session: u32,
-    /// /heartbeat per session — the heartbeat loop runs on a schedule;
-    /// anything faster is a client bug or a replay probe.
-    pub heartbeat_per_session: u32,
-    /// POST /payload per session — manifests are signed per request;
-    /// bound the signing budget one session can burn.
-    pub payload_fetch_per_session: u32,
-    /// GET /payload/* per session — blob reads are the most expensive
-    /// thing a session can ask for.
-    pub payload_download_per_session: u32,
-}
-
-// Default per-minute ceilings, grouped so a tuning change is one edit
-// and the Default impl reads as policy rather than a column of literals.
-const DEFAULT_EXCHANGE_PER_IP: u32 = 10;
-const DEFAULT_EXCHANGE_PER_ACCOUNT: u32 = 5;
-const DEFAULT_REVOKE_PER_IP: u32 = 5;
-const DEFAULT_ATTEST_PER_SESSION: u32 = 30;
-const DEFAULT_HEARTBEAT_PER_SESSION: u32 = 30;
-const DEFAULT_PAYLOAD_FETCH_PER_SESSION: u32 = 10;
-const DEFAULT_PAYLOAD_DOWNLOAD_PER_SESSION: u32 = 10;
-
-impl Default for RateLimits {
-    fn default() -> Self {
-        Self {
-            exchange_per_ip: DEFAULT_EXCHANGE_PER_IP,
-            exchange_per_account: DEFAULT_EXCHANGE_PER_ACCOUNT,
-            revoke_per_ip: DEFAULT_REVOKE_PER_IP,
-            attest_per_session: DEFAULT_ATTEST_PER_SESSION,
-            heartbeat_per_session: DEFAULT_HEARTBEAT_PER_SESSION,
-            payload_fetch_per_session: DEFAULT_PAYLOAD_FETCH_PER_SESSION,
-            payload_download_per_session: DEFAULT_PAYLOAD_DOWNLOAD_PER_SESSION,
+    /// Start configuring a state around the signing key and entitlement backend.
+    pub fn builder(issuer: Issuer, entitlements: Arc<dyn EntitlementSource>) -> AppStateBuilder {
+        AppStateBuilder {
+            issuer,
+            entitlements,
+            store: None,
+            limiter: None,
+            revocations: None,
+            audit: None,
+            lease_ttl: Duration::seconds(300),
+            grace_period: Duration::seconds(60),
+            rate_limits: RateLimits::default(),
+            admin_token: None,
+            admin_certificates: BTreeSet::new(),
+            require_client_certificates: false,
+            payloads: None,
+            download_log: None,
+            revoked_key_ids: BTreeSet::new(),
         }
     }
-}
 
-/// Sliding-window rate limiter: one timestamp deque per key, hits
-/// older than the window dropped on each check. In-memory only — a
-/// restart resets the counters, which is fine: the window is a minute.
-#[derive(Debug, Default)]
-pub struct RateLimiter {
-    hits: Mutex<HashMap<String, VecDeque<Instant>>>,
-}
-
-impl RateLimiter {
-    /// Window every limit slides over.
-    const WINDOW: StdDuration = StdDuration::from_secs(60);
-    /// Bound on tracked keys — a flood of unique IPs must not grow the
-    /// map without limit. Past the cap, stale keys are pruned; if none
-    /// are stale the request is denied rather than tracked.
-    const MAX_KEYS: usize = 65_536;
-
-    pub fn new() -> Self {
-        Self::default()
+    /// Issuer key ids clients must stop trusting, ascending.
+    pub fn revoked_key_ids(&self) -> Vec<u8> {
+        self.inner.revoked_key_ids.read().iter().copied().collect()
     }
 
-    /// Record a hit for `key`; `true` while the key is under `limit`
-    /// hits in the trailing window.
-    pub fn check(&self, key: &str, limit: u32) -> bool {
-        let now = Instant::now();
-        let mut hits = self.hits.lock().expect("rate limiter poisoned");
-        if hits.len() >= Self::MAX_KEYS {
-            let window = Self::WINDOW;
-            hits.retain(|_, dq| dq.back().is_some_and(|t| now - *t < window));
-            if hits.len() >= Self::MAX_KEYS {
-                return false;
+    /// Revoke a session and, transitively, every child attested from it.
+    /// Returns how many live sessions were killed; an unknown id is `Ok(0)`.
+    pub async fn revoke_session(&self, session_id: Uuid) -> Result<u64, ServerError> {
+        let killed = self.kill_trees([session_id]).await?;
+        if killed > 0 {
+            self.audit(AuditEvent::SessionRevoked { session_id });
+        }
+        Ok(killed)
+    }
+
+    /// Revoke every session of `account` and all their descendants. An
+    /// exchange racing this call is revoked as well.
+    pub async fn revoke_account(&self, account: &str) -> Result<u64, ServerError> {
+        let store = &self.inner.store;
+        store
+            .bump_account_epoch(account)
+            .await
+            .map_err(ServerError::Store)?;
+        let ids = store
+            .ids_for_account(account)
+            .await
+            .map_err(ServerError::Store)?;
+        let killed = self.kill_trees(ids).await?;
+        self.audit(AuditEvent::AccountRevoked {
+            account: account.to_string(),
+            sessions: killed,
+        });
+        Ok(killed)
+    }
+
+    /// Revoke an issuer key id: persist it, publish it to clients, and kill
+    /// every session and its descendants. The active signing key cannot be
+    /// revoked ([`ServerError::ActiveKeyRevoked`]); nothing is applied unless
+    /// the revocation store accepted it.
+    pub async fn revoke_key_id(&self, key_id: u8) -> Result<u64, ServerError> {
+        if key_id == self.inner.issuer.key_id() {
+            return Err(ServerError::ActiveKeyRevoked(key_id));
+        }
+        let _serial = self.inner.key_revocation.lock().await;
+        self.inner
+            .revocations
+            .persist(key_id)
+            .await
+            .map_err(ServerError::Revocations)?;
+        self.inner.revoked_key_ids.write().insert(key_id);
+        let ids = self
+            .inner
+            .store
+            .all_ids()
+            .await
+            .map_err(ServerError::Store)?;
+        let killed = self.kill_trees(ids).await?;
+        self.audit(AuditEvent::KeyRevoked {
+            key_id,
+            sessions: killed,
+        });
+        Ok(killed)
+    }
+
+    /// Drop expired sessions, handoffs, nonces, limiter buckets, and HWID
+    /// sightings. [`crate::serve()`] runs this every 30 s; embedders serving the
+    /// routers themselves call it on their own timer.
+    pub async fn sweep(&self) -> Result<usize, ServerError> {
+        let now = Utc::now();
+        self.inner.limiter.evict(std::time::Instant::now()).await;
+        self.inner
+            .fingerprints
+            .lock()
+            .retain(|_, (_, seen)| now - *seen < HWID_WINDOW);
+        self.inner
+            .store
+            .sweep(now)
+            .await
+            .map_err(ServerError::Store)
+    }
+
+    pub(crate) fn audit(&self, event: AuditEvent) {
+        self.inner.audit.record(event);
+    }
+
+    /// Record an HWID sighting; true when the account presented a different
+    /// fingerprint inside the window.
+    pub(crate) fn hwid_anomaly(
+        &self,
+        account: &str,
+        hwid_hash: [u8; 32],
+        now: DateTime<Utc>,
+    ) -> bool {
+        let mut seen = self.inner.fingerprints.lock();
+        let anomalous = seen
+            .get(account)
+            .is_some_and(|(prev, at)| *prev != hwid_hash && now - *at < HWID_WINDOW);
+        seen.insert(account.to_string(), (hwid_hash, now));
+        anomalous
+    }
+
+    /// Kill each root, then its children breadth-first. A child inserted
+    /// after its parent died is caught by attest's post-insert parent check.
+    async fn kill_trees(&self, roots: impl IntoIterator<Item = Uuid>) -> Result<u64, ServerError> {
+        let mut killed = 0;
+        let mut pending: VecDeque<Uuid> = roots.into_iter().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop_front() {
+            if !seen.insert(id) {
+                continue;
             }
+            if self.kill(&id, DeadReason::Revoked).await? {
+                killed += 1;
+            }
+            pending.extend(
+                self.inner
+                    .store
+                    .children_of(&id)
+                    .await
+                    .map_err(ServerError::Store)?,
+            );
         }
-        let dq = hits.entry(key.to_string()).or_default();
-        while dq.front().is_some_and(|t| now - *t >= Self::WINDOW) {
-            dq.pop_front();
-        }
-        if dq.len() >= limit as usize {
-            return false;
-        }
-        dq.push_back(now);
-        true
+        Ok(killed)
     }
 
-    /// The per-IP bucket key, namespaced by route so a burst on one
-    /// endpoint can't burn another's budget. Requests without connect
-    /// info (in-process test calls) share one bucket — they can't be
-    /// told apart anyway.
-    pub fn ip_key(route: &str, addr: Option<IpAddr>) -> String {
-        match addr {
-            Some(ip) => format!("{route}:ip:{ip}"),
-            None => format!("{route}:ip:unknown"),
-        }
-    }
-
-    /// The per-session bucket key, namespaced by route. Keyed by the
-    /// session_id string so the bucket exists before the store is
-    /// consulted — an unknown session burns its own budget, not a
-    /// shared one.
-    pub fn session_key(route: &str, session_id: &uuid::Uuid) -> String {
-        format!("{route}:session:{session_id}")
+    /// Mark a session dead; false when it is unknown or already dead.
+    pub(crate) async fn kill(&self, id: &Uuid, reason: DeadReason) -> Result<bool, ServerError> {
+        kill_session(self.inner.store.as_ref(), id, reason)
+            .await
+            .map_err(ServerError::Store)
     }
 }
 
-/// Plaintext sha256 of sealed artifacts, cached so manifest requests
-/// don't pay a decrypt each time. `xtask seal` writes a `.sha256`
-/// sidecar that short-circuits this entirely; the cache covers
-/// artifacts sealed before sidecars existed. Keyed by path + mtime so
-/// a re-sealed artifact can't serve a stale hash.
-#[derive(Debug, Default)]
-pub struct ArtifactHashes {
-    cache: Mutex<HashMap<PathBuf, (SystemTime, [u8; 32])>>,
-}
-
-impl ArtifactHashes {
-    pub fn new() -> Self {
-        Self::default()
+pub(crate) async fn kill_session(
+    store: &dyn SessionStore,
+    id: &Uuid,
+    reason: DeadReason,
+) -> Result<bool, BackendError> {
+    for _ in 0..CAS_ATTEMPTS {
+        let Some((mut record, version)) = store.get(id).await? else {
+            return Ok(false);
+        };
+        if record.dead.is_some() {
+            return Ok(false);
+        }
+        record.dead = Some(reason);
+        if store.replace(id, version, record).await? {
+            return Ok(true);
+        }
+        tokio::task::yield_now().await;
     }
-
-    /// The cached hash for `path` if the file's mtime still matches.
-    pub fn get(&self, path: &std::path::Path, mtime: SystemTime) -> Option<[u8; 32]> {
-        self.cache
-            .lock()
-            .expect("artifact hash cache poisoned")
-            .get(path)
-            .filter(|(cached_mtime, _)| *cached_mtime == mtime)
-            .map(|(_, hash)| *hash)
-    }
-
-    pub fn insert(&self, path: PathBuf, mtime: SystemTime, hash: [u8; 32]) {
-        self.cache
-            .lock()
-            .expect("artifact hash cache poisoned")
-            .insert(path, (mtime, hash));
-    }
+    Err("session update kept conflicting".into())
 }

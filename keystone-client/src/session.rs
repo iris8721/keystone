@@ -1,440 +1,790 @@
-//! Client-side session: the material and state an exchange produces.
-//!
-//! The session key is the only thing that proves possession to the
-//! server — it is never serialized, never logged, held in zeroizing
-//! memory, and dropped the moment the session dies so a dead session
-//! cannot mint MACs.
+//! Client-side sessions: the key material, the lease state machine judged
+//! on a monotonic session clock, and the cheap [`SessionGate`] a payload
+//! consults before every protected operation.
 
 use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Utc};
+use keystone_core::wire::Verdict;
 use keystone_core::{
-    ConsumedSet, DeadReason, Handoff, HandoffPayload, KeystoneError, Lease, Manifest, SessionState,
+    ConsumedSet, DeadReason, FeatureGrant, HandoffPayload, HandoffToken, KeyWrap, KeystoneError,
+    Lease, RequestBinding, SessionState, mac_request, unwrap_artifact_key,
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::ClientError;
 
-/// A live session produced by `KeystoneClient::exchange`.
-///
-/// Owns the session key and the local `SessionState` mirror. The
-/// server is authoritative — this state only decides whether the app
-/// may keep running between heartbeats.
-pub struct ClientSession {
-    session_id: Uuid,
-    /// `None` once the session is dead: kill drops the key so no
-    /// further attest/heartbeat MAC can ever be produced from it. The
-    /// wrapper zeroizes the bytes on drop, so a dead session leaves no
-    /// key material behind in memory either.
-    session_key: Option<Zeroizing<[u8; 32]>>,
-    state: SessionState,
-    /// Response nonces this session already accepted. A replayed
-    /// envelope carries a nonce we've seen — rejected even if it still
-    /// verifies cryptographically.
+/// First retry delay after a failed heartbeat; doubles per attempt.
+const RETRY_BASE: StdDuration = StdDuration::from_secs(1);
+/// Ceiling on a single retry delay.
+const RETRY_CAP: StdDuration = StdDuration::from_secs(30);
+/// Shortest interval between two renewals.
+const MIN_RENEW_INTERVAL: Duration = Duration::seconds(5);
+/// Longest single sleep the clock maps a deadline to.
+const MAX_SLEEP: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+
+/// Server time as this process best knows it: a server timestamp taken
+/// from a signed body, advanced by the monotonic clock. Wall-clock
+/// changes on this machine never move it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionClock {
+    anchor: Instant,
+    server_at_anchor: DateTime<Utc>,
+}
+
+impl SessionClock {
+    /// A clock reading `server_now` at this instant.
+    pub(crate) fn starting_at(server_now: DateTime<Utc>) -> Self {
+        Self::anchored(Instant::now(), server_now)
+    }
+
+    fn anchored(anchor: Instant, server_at_anchor: DateTime<Utc>) -> Self {
+        Self {
+            anchor,
+            server_at_anchor,
+        }
+    }
+
+    /// Current server-aligned time.
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        self.at(Instant::now())
+    }
+
+    fn at(&self, instant: Instant) -> DateTime<Utc> {
+        let elapsed = Duration::from_std(instant.saturating_duration_since(self.anchor))
+            .unwrap_or(Duration::MAX);
+        self.server_at_anchor
+            .checked_add_signed(elapsed)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// The monotonic instant at which this clock reads `t`.
+    fn instant_at(&self, t: DateTime<Utc>) -> Instant {
+        let delta = t - self.server_at_anchor;
+        match delta.to_std() {
+            Ok(ahead) => self.anchor + ahead.min(MAX_SLEEP),
+            Err(_) => {
+                let behind = (-delta).to_std().unwrap_or(StdDuration::ZERO);
+                self.anchor.checked_sub(behind).unwrap_or(self.anchor)
+            }
+        }
+    }
+}
+
+/// Pending heartbeat retry after a failure.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    attempts: u32,
+    at: Instant,
+}
+
+/// Everything mutable about a session, behind one lock that is never held
+/// across an await.
+struct State {
+    key: Option<Zeroizing<[u8; 32]>>,
+    lease: SessionState,
+    features: Vec<FeatureGrant>,
+    clock: SessionClock,
     consumed: ConsumedSet,
-    /// Latest observed offset between server clock and ours, from the
-    /// server_time field in signed bodies. Every freshness judgment
-    /// this session makes runs on drift-adjusted time — a skewed
-    /// local clock must not misjudge an envelope or a deadline.
-    clock_drift: chrono::Duration,
-    /// Sessions opened from a handoff have not yet performed the
-    /// application's own attestation (README step 6). Until
-    /// `attest` succeeds, no session-bound operation may run — the
-    /// app cannot skip proving itself to the server.
-    pending_attest: bool,
+    retry: Option<Retry>,
+    /// Longest lease the session has held; sets the renewal floor.
+    lease_len: Duration,
+    /// The last renewal did not move `expires_at`: renewing is pointless.
+    capped: bool,
+}
+
+impl State {
+    fn dead_reason(&self) -> Option<DeadReason> {
+        dead_reason_at(&self.lease, self.clock.now())
+    }
+
+    fn kill(&mut self, reason: DeadReason) {
+        self.key = None;
+        self.lease.kill(reason);
+    }
+}
+
+/// Why `state` no longer authorizes at `now`, including a lapsed lease or
+/// grace deadline that has not been recorded as a kill yet.
+fn dead_reason_at(state: &SessionState, now: DateTime<Utc>) -> Option<DeadReason> {
+    if let SessionState::Dead { reason } = state {
+        return Some(*reason);
+    }
+    match state.authorize(now) {
+        Ok(()) => None,
+        Err(KeystoneError::GraceExhausted) => Some(DeadReason::GraceExhausted),
+        Err(_) => Some(DeadReason::Expired),
+    }
+}
+
+fn lease_len(lease: &Lease) -> Duration {
+    lease.expires_at - lease.granted_at
+}
+
+struct Inner {
+    session_id: Uuid,
+    product: String,
+    state: RwLock<State>,
+}
+
+impl Inner {
+    // A poisoned lock still holds a consistent state: every writer replaces
+    // whole values.
+    fn read(&self) -> RwLockReadGuard<'_, State> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A read-only, network-free view of a session's authorization, cheap to
+/// clone into every thread of a payload. Reflects each lease the session
+/// installs and each kill it records.
+#[derive(Clone)]
+pub struct SessionGate {
+    inner: Arc<Inner>,
+}
+
+impl SessionGate {
+    /// `Ok` while the session is alive and its lease (or grace window) is
+    /// valid on the session clock; otherwise `NotAuthenticated`.
+    pub fn authorize(&self) -> Result<(), ClientError> {
+        match self.dead_reason() {
+            None => Ok(()),
+            Some(_) => Err(ClientError::NotAuthenticated),
+        }
+    }
+
+    /// True when the session is authorized and holds a grant for `name`
+    /// that has not expired on the session clock.
+    pub fn has_feature(&self, name: &str) -> bool {
+        let state = self.inner.read();
+        let now = state.clock.now();
+        dead_reason_at(&state.lease, now).is_none()
+            && state
+                .features
+                .iter()
+                .any(|grant| grant.feature == name && grant.is_active(now))
+    }
+
+    /// Whether [`SessionGate::authorize`] would succeed.
+    pub fn is_alive(&self) -> bool {
+        self.dead_reason().is_none()
+    }
+
+    /// Why the session no longer authorizes, if it does not.
+    pub fn dead_reason(&self) -> Option<DeadReason> {
+        self.inner.read().dead_reason()
+    }
+}
+
+impl fmt::Debug for SessionGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionGate")
+            .field("session_id", &self.inner.session_id)
+            .field("dead_reason", &self.dead_reason())
+            .finish()
+    }
+}
+
+/// A live session from [`crate::KeystoneClient::exchange`] or
+/// [`crate::KeystoneClient::attest`]. A cheap handle: clones share the key,
+/// lease, and gate, so a keepalive task and request callers can hold the
+/// same session. The key is wiped the moment the session dies; the server
+/// stays authoritative.
+#[derive(Clone)]
+pub struct ClientSession {
+    inner: Arc<Inner>,
 }
 
 impl ClientSession {
-    /// Build a session from a verified exchange. `lease` becomes the
-    /// initial Active state.
-    pub(crate) fn new(session_id: Uuid, session_key: [u8; 32], lease: Lease) -> Self {
-        Self {
-            session_id,
-            session_key: Some(Zeroizing::new(session_key)),
-            state: SessionState::Active { lease },
+    pub(crate) fn new(
+        session_id: Uuid,
+        product: String,
+        key: Zeroizing<[u8; 32]>,
+        lease: Lease,
+        features: Vec<FeatureGrant>,
+        clock: SessionClock,
+    ) -> Self {
+        let state = State {
+            key: Some(key),
+            lease_len: lease_len(&lease),
+            lease: SessionState::Active { lease },
+            features,
+            clock,
             consumed: ConsumedSet::new(),
-            clock_drift: chrono::Duration::zero(),
-            // The launcher authenticated itself at exchange — only
-            // handoff sessions carry the pending gate.
-            pending_attest: false,
+            retry: None,
+            capped: false,
+        };
+        Self {
+            inner: Arc::new(Inner {
+                session_id,
+                product,
+                state: RwLock::new(state),
+            }),
         }
     }
 
-    /// Record the offset between the server's clock and ours. Called
-    /// with the server_time from each signed body.
-    pub(crate) fn observe_server_time(&mut self, server_time: DateTime<Utc>) {
-        self.clock_drift = server_time - Utc::now();
-    }
-
-    /// The last observed server-minus-local clock offset.
-    pub fn clock_drift(&self) -> chrono::Duration {
-        self.clock_drift
-    }
-
-    /// Drift-adjusted current time: the server's clock as best we know
-    /// it. Freshness checks run on this so a skewed local clock can
-    /// neither stretch a live envelope nor shorten a grace window.
-    pub(crate) fn now(&self) -> DateTime<Utc> {
-        Utc::now() + self.clock_drift
-    }
-
-    /// Whether this session still owes the server its own attestation.
-    pub(crate) fn is_pending_attest(&self) -> bool {
-        self.pending_attest
-    }
-
-    /// Called by `KeystoneClient::attest` after the attested lease is
-    /// verified and installed — the gate lifts only on success.
-    pub(crate) fn clear_pending_attest(&mut self) {
-        self.pending_attest = false;
-    }
-
+    /// The server's id for this session.
     pub fn session_id(&self) -> Uuid {
-        self.session_id
+        self.inner.session_id
     }
 
-    /// The session key, or `MissingSessionKey` once the session is
-    /// dead and the material dropped.
-    pub(crate) fn session_key(&self) -> Result<&[u8; 32], ClientError> {
-        self.session_key
-            .as_deref()
-            .ok_or(ClientError::MissingSessionKey)
+    /// The product this session is entitled to.
+    pub fn product(&self) -> &str {
+        &self.inner.product
     }
 
-    /// May protected operations run right now? Judges on
-    /// drift-adjusted time and owns the consequences: an Expired or
-    /// GraceExhausted verdict kills the session and drops the key —
-    /// "grace exhausted → clear session material" (README step 9).
-    /// A handoff session that hasn't attested yet is NotAuthenticated
-    /// regardless of what its lease says.
-    pub fn authorize(&mut self) -> Result<(), ClientError> {
-        let verdict = self.state.authorize(self.now());
-        match verdict {
-            Err(KeystoneError::GraceExhausted) => {
-                self.kill(DeadReason::GraceExhausted);
-                Err(ClientError::GraceExhausted)
-            }
-            Err(KeystoneError::Expired) => {
-                self.kill(DeadReason::Expired);
-                Err(ClientError::Core(KeystoneError::Expired))
-            }
-            Err(e) => Err(ClientError::Core(e)),
-            Ok(()) if self.pending_attest => Err(ClientError::NotAuthenticated),
-            Ok(()) => Ok(()),
+    /// A read-only gate sharing this session's state.
+    pub fn gate(&self) -> SessionGate {
+        SessionGate {
+            inner: Arc::clone(&self.inner),
         }
     }
 
-    /// True while the session is Active or in Grace — i.e. a heartbeat
-    /// could still succeed. Dead is final.
-    pub fn is_alive(&self) -> bool {
-        !matches!(self.state, SessionState::Dead { .. })
+    /// Like [`SessionGate::authorize`], and records the death when the lease
+    /// or grace window has lapsed, wiping the session key.
+    pub fn authorize(&self) -> Result<(), ClientError> {
+        let mut state = self.inner.write();
+        match state.dead_reason() {
+            None => Ok(()),
+            Some(reason) => {
+                state.kill(reason);
+                Err(ClientError::NotAuthenticated)
+            }
+        }
     }
 
-    /// When the next heartbeat should fire: ~80% through the current
-    /// lease window, so a renewal lands well before expiry and leaves
-    /// room for a retry. In Grace the deadline is the hard stop — the
-    /// result is clamped to it so a caller sleeping until `due` always
-    /// wakes inside the grace window. `None` for a dead session; never
-    /// returns a time in the past.
-    ///
-    /// The caller owns the loop — this only reports the deadline.
-    pub fn next_heartbeat_due(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let (lease, deadline) = match &self.state {
-            SessionState::Active { lease } => (lease, None),
-            SessionState::Grace { lease, deadline } => (lease, Some(*deadline)),
+    /// Whether the session still authorizes on the session clock.
+    pub fn is_alive(&self) -> bool {
+        self.dead_reason().is_none()
+    }
+
+    /// Why the session no longer authorizes, if it does not.
+    pub fn dead_reason(&self) -> Option<DeadReason> {
+        self.inner.read().dead_reason()
+    }
+
+    /// Feature grants from the most recent lease body.
+    pub fn features(&self) -> Vec<FeatureGrant> {
+        self.inner.read().features.clone()
+    }
+
+    /// When the next heartbeat should be sent. Normally 80% into the lease
+    /// but no sooner than `max(5 s, longest lease / 10)` after it was
+    /// granted; after a failure, the pending backoff retry. Once a renewal
+    /// fails to extend the lease this is the lease expiry itself. Never later
+    /// than the end of the lease or grace window; `None` once dead.
+    pub fn next_heartbeat_due(&self) -> Option<Instant> {
+        let state = self.inner.read();
+        if state.dead_reason().is_some() {
+            return None;
+        }
+        let (lease, stop) = match &state.lease {
+            SessionState::Active { lease } => (lease, lease.expires_at),
+            SessionState::Grace { lease, deadline } => (lease, (*deadline).min(lease.expires_at)),
             SessionState::Dead { .. } => return None,
         };
-        let window = lease.expires_at - lease.granted_at;
-        let mut due = lease.granted_at + Duration::milliseconds(window.num_milliseconds() * 4 / 5);
-        if let Some(deadline) = deadline {
-            due = due.min(deadline);
+        let stop = state.clock.instant_at(stop);
+        if state.capped {
+            return Some(stop);
         }
-        Some(due.max(now))
+        let due = match state.retry {
+            Some(retry) => retry.at,
+            None => {
+                let floor = MIN_RENEW_INTERVAL.max(state.lease_len / 10);
+                let interval = (lease_len(lease) * 4 / 5).max(floor);
+                state.clock.instant_at(lease.granted_at + interval)
+            }
+        };
+        Some(due.min(stop))
     }
 
-    /// Record a nonce this session accepted, so a replayed envelope is
-    /// rejected even when it still verifies. The exchange envelope's
-    /// nonce is consumed at construction; the app calls this for any
-    /// further envelopes it accepts on this session.
-    pub fn consume_nonce(
-        &mut self,
+    /// Current server-aligned time.
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        self.inner.read().clock.now()
+    }
+
+    /// Server clock minus the local wall clock, handed to a child process.
+    pub(crate) fn server_offset(&self) -> Duration {
+        self.now() - Utc::now()
+    }
+
+    /// MAC a request under the session key; `NotAuthenticated` once the key
+    /// is gone.
+    pub(crate) fn mac(
+        &self,
+        nonce: &[u8; 32],
+        issued_at: DateTime<Utc>,
+        context: &[u8],
+    ) -> Result<[u8; 32], ClientError> {
+        let state = self.inner.read();
+        let key = state.key.as_deref().ok_or(ClientError::NotAuthenticated)?;
+        Ok(mac_request(
+            key,
+            &RequestBinding {
+                session_id: &self.inner.session_id,
+                nonce,
+                issued_at,
+                context,
+            },
+        ))
+    }
+
+    /// Unwrap an artifact key wrapped for this session and `nonce`.
+    pub(crate) fn unwrap_artifact_key(
+        &self,
+        nonce: &[u8; 32],
+        wrap: &KeyWrap,
+    ) -> Result<Zeroizing<[u8; 32]>, ClientError> {
+        let state = self.inner.read();
+        let key = state.key.as_deref().ok_or(ClientError::NotAuthenticated)?;
+        unwrap_artifact_key(key, nonce, wrap).map_err(ClientError::InvalidResponse)
+    }
+
+    /// Record an accepted envelope's challenge so the same response is never
+    /// accepted twice.
+    pub(crate) fn consume(
+        &self,
         nonce: [u8; 32],
         expires_at: DateTime<Utc>,
-    ) -> Result<(), KeystoneError> {
-        self.consumed.consume(nonce, expires_at)
+    ) -> Result<(), ClientError> {
+        let mut state = self.inner.write();
+        let now = state.clock.now();
+        state.consumed.evict_expired(now);
+        state
+            .consumed
+            .consume(nonce, expires_at, now)
+            .map_err(ClientError::InvalidResponse)
     }
 
-    /// Whether a nonce was already accepted by this session.
-    pub fn is_nonce_consumed(&self, nonce: &[u8; 32]) -> bool {
-        self.consumed.is_consumed(nonce)
-    }
-
-    /// Whether a manifest grants `name` right now. Convenience over
-    /// `Manifest::has_feature` — it reports the grant only; whether the
-    /// session itself may run protected operations is `authorize`'s
-    /// call.
-    pub fn has_feature(&self, manifest: &Manifest, name: &str, now: DateTime<Utc>) -> bool {
-        manifest.has_feature(name, now)
-    }
-
-    /// Produce the encrypted handoff for the application this client
-    /// is about to launch (README step 5).
-    ///
-    /// Returns the sealed blob plus the freshly generated handoff key.
-    /// The blob carries only what the app needs to attest — session
-    /// id, session key, lease — and the caller delivers the key to the
-    /// child through the launch channel (env var, argv, shared
-    /// memory). Without it the blob is AEAD-sealed noise; with it, only
-    /// the intended `process_id` can open it — a name-level binding to
-    /// a claimed identity, not OS-verified process identity.
-    ///
-    /// The blob never carries an issuer key: the app bakes its own
-    /// `TrustedIssuers` at build time, and the loader is never a
-    /// source of trust.
-    ///
-    /// A dead session cannot mint a handoff — its key is already gone.
-    /// `ttl` is clamped to `MAX_HANDOFF_TTL`: a handoff is a
-    /// launch-time event, not a stored credential, so a caller asking
-    /// for days gets minutes.
-    pub fn make_handoff(
+    /// Install a verified lease body: refresh the lease, features, and clock
+    /// anchor and clear any retry. A grace window that lapsed while the
+    /// request was in flight is not revived.
+    pub(crate) fn install_lease(
         &self,
-        process_id: &str,
-        ttl: Duration,
-    ) -> Result<(Handoff, [u8; 32]), ClientError> {
-        const MAX_HANDOFF_TTL: Duration = Duration::minutes(5);
-        let ttl = ttl.min(MAX_HANDOFF_TTL);
-        let (session_key, lease) = match &self.state {
-            SessionState::Active { lease } => (self.session_key()?, lease.clone()),
-            // A handoff minted inside grace must die with the client's
-            // grace window — the sealed lease never authorizes past
-            // the deadline the first failure fixed.
-            SessionState::Grace { lease, deadline } => {
-                let mut lease = lease.clone();
-                lease.expires_at = lease.expires_at.min(*deadline);
-                (self.session_key()?, lease)
+        lease: Lease,
+        features: Vec<FeatureGrant>,
+        server_time: DateTime<Utc>,
+    ) {
+        let mut state = self.inner.write();
+        let now = state.clock.now();
+        let previous_expiry = match &state.lease {
+            SessionState::Active { lease } | SessionState::Grace { lease, .. } => {
+                Some(lease.expires_at)
             }
-            SessionState::Dead { .. } => return Err(ClientError::NotAuthenticated),
+            SessionState::Dead { .. } => None,
         };
-        let mut handoff_key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut handoff_key);
-        let blob = Handoff::seal(
-            &handoff_key,
-            &HandoffPayload {
-                session_id: self.session_id,
-                session_key: *session_key,
-                lease,
-                clock_drift_millis: self.clock_drift.num_milliseconds(),
-            },
-            process_id,
-            ttl,
-        )?;
-        Ok((blob, handoff_key))
+        let expires_at = lease.expires_at;
+        let len = lease_len(&lease);
+        state.lease.on_heartbeat_ok(lease, now);
+        if matches!(state.lease, SessionState::Dead { .. }) {
+            state.key = None;
+            return;
+        }
+        state.capped = previous_expiry.is_some_and(|previous| expires_at <= previous);
+        state.lease_len = state.lease_len.max(len);
+        state.features = features;
+        state.clock = SessionClock::starting_at(server_time);
+        state.retry = None;
     }
 
-    /// The application side of the handoff: open the blob with the key
-    /// the launcher delivered, and get a live session ready to attest.
-    ///
-    /// This is how the payload obtains session material without ever
-    /// seeing credentials — it still must prove session-key possession
-    /// to the server itself via `KeystoneClient::attest`. The app
-    /// inherits the loader's observed clock drift, so that first
-    /// attest is stamped with an `issued_at` already inside the
-    /// server's skew window even on a badly skewed local clock.
-    pub fn from_handoff(
-        handoff_key: &[u8; 32],
-        blob: &Handoff,
-        process_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<Self, ClientError> {
-        let payload = blob.open(handoff_key, process_id, now)?;
-        // `HandoffPayload` zeroizes on drop, so its fields cannot be
-        // moved out — copy the key into its own zeroizing slot and
-        // clone the lease.
-        Ok(Self {
-            session_id: payload.session_id,
-            session_key: Some(Zeroizing::new(payload.session_key)),
-            state: SessionState::Active {
-                lease: payload.lease.clone(),
-            },
-            consumed: ConsumedSet::new(),
-            clock_drift: chrono::Duration::milliseconds(payload.clock_drift_millis),
-            // The app still owes the server its own attestation —
-            // opening the blob proves launch-channel possession, not
-            // session-key possession to the server.
-            pending_attest: true,
-        })
+    /// Re-anchor the clock on a signed server time outside a lease body.
+    pub(crate) fn observe_server_time(&self, server_time: DateTime<Utc>) {
+        self.inner.write().clock = SessionClock::starting_at(server_time);
     }
 
-    /// Read-only view of the state machine — heartbeat inspects it to
-    /// decide whether a 410 means Expired or GraceExhausted.
-    pub(crate) fn state(&self) -> &SessionState {
-        &self.state
+    /// A heartbeat failed: kills end the session, transient failures start
+    /// (or continue) grace, and both non-kill outcomes schedule a jittered,
+    /// exponentially growing retry.
+    pub(crate) fn heartbeat_failed(&self, verdict: Verdict) {
+        let mut state = self.inner.write();
+        match verdict {
+            Verdict::Kill(reason) => return state.kill(reason),
+            Verdict::Transient => {
+                let now = state.clock.now();
+                state.lease.on_transient_failure(now);
+            }
+            Verdict::RequestError => {}
+        }
+        let attempts = state
+            .retry
+            .map_or(1, |retry| retry.attempts.saturating_add(1));
+        state.retry = Some(Retry {
+            attempts,
+            at: Instant::now() + retry_delay(attempts, rand::random::<f64>()),
+        });
     }
 
-    /// Drop consumed nonces whose envelopes are expired anyway — they
-    /// can't be accepted again, so remembering them is waste. Called
-    /// on every envelope-accept path.
-    pub(crate) fn evict_expired_nonces(&mut self, now: DateTime<Utc>) {
-        self.consumed.evict_expired(now);
+    /// A non-heartbeat request was rejected: only kill verdicts touch the
+    /// session.
+    pub(crate) fn request_failed(&self, verdict: Verdict) {
+        if let Verdict::Kill(reason) = verdict {
+            self.kill(reason);
+        }
     }
 
-    /// Successful heartbeat: install the refreshed lease, clear grace.
-    /// Uses drift-adjusted time so a late response cannot resurrect a
-    /// session whose grace deadline already passed.
-    pub(crate) fn on_heartbeat_ok(&mut self, lease: Lease) {
-        let now = self.now();
-        self.state.on_heartbeat_ok(lease, now);
-    }
-
-    /// Transient failure: first one fixes the grace deadline, later
-    /// ones leave it untouched.
-    pub(crate) fn on_transient_failure(&mut self, now: DateTime<Utc>) {
-        self.state.on_transient_failure(now);
-    }
-
-    /// Terminal rejection. Drops the session key first — a dead
-    /// session must not retain the material that could mint MACs, and
-    /// the `Zeroizing` wrapper scrubs the bytes as it goes.
-    pub(crate) fn kill(&mut self, reason: DeadReason) {
-        self.session_key = None;
-        self.state.kill(reason);
+    /// End the session for good and wipe the key.
+    pub(crate) fn kill(&self, reason: DeadReason) {
+        self.inner.write().kill(reason);
     }
 }
 
-/// Manual Debug: the session key is redacted unconditionally. The
-/// session id is shown — the client needs it for log correlation and
-/// it is useless without the key.
 impl fmt::Debug for ClientSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClientSession")
-            .field("session_id", &self.session_id)
-            .field("session_key", &"[redacted]")
-            .field("state", &self.state)
+            .field("session_id", &self.inner.session_id)
+            .field("product", &self.inner.product)
+            .field("state", &self.inner.read().lease)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Delay before retry `attempt` (1-based): `RETRY_BASE` doubled per
+/// attempt up to `RETRY_CAP`, scaled into its upper half by `jitter` in
+/// `[0, 1]`.
+fn retry_delay(attempt: u32, jitter: f64) -> StdDuration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    let ceiling = RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_CAP);
+    ceiling.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0))
+}
+
+/// A child process's handoff, opened but not yet redeemed. Redeem it with
+/// [`crate::KeystoneClient::attest`] to obtain the child's own session.
+pub struct PendingSession {
+    payload: HandoffPayload,
+    process_id: String,
+    clock: SessionClock,
+}
+
+impl PendingSession {
+    /// Open `token` as `process_id`, the identity the child will attest
+    /// under. Fails with `Core` when the token was sealed for another
+    /// identity, tampered with, or has expired.
+    pub fn from_handoff(token: HandoffToken, process_id: &str) -> Result<Self, ClientError> {
+        let payload = token.open(process_id)?;
+        let server_now = Duration::try_milliseconds(payload.server_offset_millis)
+            .and_then(|offset| Utc::now().checked_add_signed(offset))
+            .ok_or_else(|| KeystoneError::Malformed("handoff server offset".into()))?;
+        Ok(Self {
+            payload,
+            process_id: process_id.to_owned(),
+            clock: SessionClock::starting_at(server_now),
+        })
+    }
+
+    /// The loader session that minted the handoff.
+    pub fn parent_session_id(&self) -> Uuid {
+        self.payload.parent_session_id
+    }
+
+    /// The product the child session will be for.
+    pub fn product(&self) -> &str {
+        &self.payload.product
+    }
+
+    /// The identity the handoff was opened as.
+    pub fn process_id(&self) -> &str {
+        &self.process_id
+    }
+
+    /// Last server instant at which the handoff can be redeemed.
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        self.payload.expires_at
+    }
+
+    pub(crate) fn payload(&self) -> &HandoffPayload {
+        &self.payload
+    }
+
+    pub(crate) fn clock(&self) -> SessionClock {
+        self.clock
+    }
+}
+
+impl fmt::Debug for PendingSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingSession")
+            .field("parent_session_id", &self.payload.parent_session_id)
+            .field("product", &self.payload.product)
+            .field("process_id", &self.process_id)
+            .field("expires_at", &self.payload.expires_at)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use keystone_core::wire::ErrorCode;
 
-    fn session() -> ClientSession {
+    use super::*;
+    use crate::error::session_verdict;
+
+    fn lease_at(start: DateTime<Utc>, ttl_secs: i64, grace_secs: i64) -> Lease {
+        Lease {
+            session_id: Uuid::nil(),
+            granted_at: start,
+            expires_at: start + Duration::seconds(ttl_secs),
+            grace_period: Duration::seconds(grace_secs),
+        }
+    }
+
+    fn session_on(clock: SessionClock, lease: Lease, features: Vec<FeatureGrant>) -> ClientSession {
         ClientSession::new(
             Uuid::nil(),
-            [0xAB; 32],
-            Lease {
-                session_id: Uuid::nil(),
-                granted_at: Utc::now(),
-                expires_at: Utc::now() + Duration::seconds(300),
-                grace_period: Duration::seconds(60),
-            },
+            "app".into(),
+            Zeroizing::new([0xAB; 32]),
+            lease,
+            features,
+            clock,
         )
     }
 
-    #[test]
-    fn debug_never_leaks_session_key() {
-        let s = session();
-        let dbg = format!("{s:?}");
-        // The key bytes would render as "171" (0xAB) in a debug list —
-        // assert the marker is present and the material is not.
-        assert!(dbg.contains("[redacted]"));
-        assert!(!dbg.contains("171"));
+    fn fresh_session(ttl_secs: i64, grace_secs: i64) -> ClientSession {
+        let now = Utc::now();
+        session_on(
+            SessionClock::starting_at(now),
+            lease_at(now, ttl_secs, grace_secs),
+            Vec::new(),
+        )
+    }
+
+    fn has_key(session: &ClientSession) -> bool {
+        session.inner.read().key.is_some()
+    }
+
+    fn is_active(session: &ClientSession) -> bool {
+        matches!(session.inner.read().lease, SessionState::Active { .. })
+    }
+
+    fn grace_deadline(session: &ClientSession) -> DateTime<Utc> {
+        match &session.inner.read().lease {
+            SessionState::Grace { deadline, .. } => *deadline,
+            other => panic!("expected grace, got {other:?}"),
+        }
+    }
+
+    fn instant_of(session: &ClientSession, t: DateTime<Utc>) -> Instant {
+        session.inner.read().clock.instant_at(t)
     }
 
     #[test]
-    fn kill_drops_key_and_stays_dead() {
-        let mut s = session();
-        s.kill(DeadReason::Revoked);
-        assert!(!s.is_alive());
+    fn session_clock_ignores_wall_clock() {
+        let server = DateTime::from_timestamp(978_307_200, 0).unwrap();
+        let anchor = Instant::now();
+        let clock = SessionClock::anchored(anchor, server);
+        assert_eq!(clock.at(anchor), server);
+        assert_eq!(
+            clock.at(anchor + StdDuration::from_secs(5)),
+            server + Duration::seconds(5)
+        );
+        assert_eq!(
+            clock.instant_at(server + Duration::seconds(90)),
+            anchor + StdDuration::from_secs(90)
+        );
+
+        // The wall clock is decades past this lease; the session clock is not.
+        let behind = session_on(
+            SessionClock::starting_at(server),
+            lease_at(server, 300, 60),
+            Vec::new(),
+        );
+        assert!(behind.authorize().is_ok());
+        assert!(behind.next_heartbeat_due().is_some());
+
+        // The wall clock is decades before this lease's expiry; the session
+        // clock is past it.
+        let future = DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        let ahead = session_on(
+            SessionClock::starting_at(future),
+            lease_at(future - Duration::seconds(301), 300, 60),
+            Vec::new(),
+        );
         assert!(matches!(
-            s.session_key(),
-            Err(ClientError::MissingSessionKey)
-        ));
-        assert!(matches!(
-            s.authorize(),
-            Err(ClientError::Core(KeystoneError::Revoked))
-        ));
-    }
-
-    #[test]
-    fn heartbeat_due_at_eighty_percent() {
-        let granted = Utc::now();
-        let mut s = session();
-        s.on_heartbeat_ok(Lease {
-            session_id: Uuid::nil(),
-            granted_at: granted,
-            expires_at: granted + Duration::seconds(100),
-            grace_period: Duration::seconds(60),
-        });
-        let due = s.next_heartbeat_due(granted).unwrap();
-        assert_eq!(due, granted + Duration::seconds(80));
-    }
-
-    #[test]
-    fn grace_exhausted_authorize_kills_and_drops_key() {
-        let mut s = session();
-        // Enter grace, then push the observed server clock past the
-        // deadline — authorize must turn the verdict into a kill.
-        s.on_transient_failure(Utc::now());
-        s.observe_server_time(Utc::now() + Duration::seconds(120));
-        assert!(matches!(s.authorize(), Err(ClientError::GraceExhausted)));
-        assert!(!s.is_alive());
-        assert!(matches!(
-            s.session_key(),
-            Err(ClientError::MissingSessionKey)
-        ));
-    }
-
-    #[test]
-    fn handoff_in_grace_clamps_lease_to_deadline() {
-        let mut s = session();
-        let failure_at = Utc::now();
-        s.on_transient_failure(failure_at);
-        let deadline = failure_at + Duration::seconds(60);
-
-        let (blob, key) = s.make_handoff("app", Duration::seconds(60)).unwrap();
-        let app = ClientSession::from_handoff(&key, &blob, "app", Utc::now()).unwrap();
-        // The sealed lease dies with the grace window (~60s out), not
-        // at the original 300s lease expiry.
-        let SessionState::Active { lease } = app.state() else {
-            panic!("handoff session must open Active")
-        };
-        assert!(lease.expires_at <= deadline + Duration::seconds(1));
-        assert!(lease.expires_at < failure_at + Duration::seconds(300));
-    }
-
-    #[test]
-    fn handoff_session_is_pending_until_attest() {
-        let s = session();
-        let (blob, key) = s.make_handoff("app", Duration::seconds(60)).unwrap();
-        let mut app = ClientSession::from_handoff(&key, &blob, "app", Utc::now()).unwrap();
-        assert!(matches!(
-            app.authorize(),
+            ahead.authorize(),
             Err(ClientError::NotAuthenticated)
         ));
-        app.clear_pending_attest();
-        assert!(app.authorize().is_ok());
+        assert_eq!(ahead.dead_reason(), Some(DeadReason::Expired));
+        assert!(!has_key(&ahead));
     }
 
     #[test]
-    fn handoff_carries_and_applies_clock_drift() {
-        let mut s = session();
-        // The loader learned the server runs +90s; the app must open
-        // with the same offset so its first attest is stamped inside
-        // the server's window instead of on the raw local clock.
-        s.observe_server_time(Utc::now() + Duration::seconds(90));
-        let (blob, key) = s.make_handoff("app", Duration::seconds(60)).unwrap();
-        let app = ClientSession::from_handoff(&key, &blob, "app", Utc::now()).unwrap();
+    fn gate_verdicts_across_active_grace_dead() {
+        fn shareable<T: Clone + Send + Sync + 'static>(_: &T) {}
 
-        assert_eq!(
-            app.clock_drift().num_milliseconds(),
-            s.clock_drift().num_milliseconds()
+        let session = fresh_session(300, 60);
+        shareable(&session);
+        let gate = session.gate();
+        shareable(&gate);
+        assert!(gate.authorize().is_ok());
+        assert!(gate.is_alive());
+        assert_eq!(gate.dead_reason(), None);
+
+        session.heartbeat_failed(Verdict::Transient);
+        grace_deadline(&session);
+        assert!(gate.authorize().is_ok());
+        assert!(gate.is_alive());
+
+        // Lapse the grace window on the session clock.
+        {
+            let mut state = session.inner.write();
+            let past = state.clock.now() - Duration::seconds(1);
+            if let SessionState::Grace { deadline, .. } = &mut state.lease {
+                *deadline = past;
+            }
+        }
+        assert!(matches!(
+            gate.authorize(),
+            Err(ClientError::NotAuthenticated)
+        ));
+        assert_eq!(gate.dead_reason(), Some(DeadReason::GraceExhausted));
+        assert!(!gate.is_alive());
+        assert!(session.authorize().is_err());
+        assert!(!has_key(&session));
+        assert_eq!(session.next_heartbeat_due(), None);
+
+        let revoked = fresh_session(300, 60);
+        let revoked_gate = revoked.clone().gate();
+        revoked.heartbeat_failed(Verdict::Kill(DeadReason::Revoked));
+        assert_eq!(revoked_gate.dead_reason(), Some(DeadReason::Revoked));
+        assert!(revoked_gate.authorize().is_err());
+        assert!(!has_key(&revoked));
+    }
+
+    #[test]
+    fn has_feature_requires_live_session_and_unexpired_grant() {
+        let now = Utc::now();
+        let session = session_on(
+            SessionClock::starting_at(now),
+            lease_at(now, 300, 60),
+            vec![
+                FeatureGrant {
+                    feature: "live".into(),
+                    expires_at: now + Duration::seconds(60),
+                },
+                FeatureGrant {
+                    feature: "lapsed".into(),
+                    expires_at: now - Duration::seconds(1),
+                },
+            ],
         );
-        let ahead = app.now() - Utc::now();
-        assert!(
-            (ahead - Duration::seconds(90)).num_milliseconds().abs() < 1000,
-            "handoff session must run ~90s ahead of local, got {ahead}"
+        let gate = session.gate();
+        assert!(gate.has_feature("live"));
+        assert!(!gate.has_feature("lapsed"));
+        assert!(!gate.has_feature("absent"));
+
+        session.kill(DeadReason::Revoked);
+        assert!(!gate.has_feature("live"));
+    }
+
+    #[test]
+    fn verdicts_come_from_error_codes_and_codeless_is_transient() {
+        let codeless = ClientError::ServerRejected {
+            status: 404,
+            code: None,
+            message: String::new(),
+        };
+        assert!(codeless.is_retryable());
+        let session = fresh_session(300, 60);
+        session.heartbeat_failed(session_verdict(None));
+        assert!(session.is_alive());
+        grace_deadline(&session);
+
+        let unknown = ClientError::ServerRejected {
+            status: 404,
+            code: Some(ErrorCode::UnknownSession),
+            message: String::new(),
+        };
+        assert!(!unknown.is_retryable());
+        let session = fresh_session(300, 60);
+        session.heartbeat_failed(session_verdict(Some(ErrorCode::UnknownSession)));
+        assert_eq!(session.dead_reason(), Some(DeadReason::UnknownSession));
+
+        let session = fresh_session(300, 60);
+        session.heartbeat_failed(session_verdict(Some(ErrorCode::BadRequest)));
+        assert!(is_active(&session));
+
+        let rate_limited = ClientError::ServerRejected {
+            status: 429,
+            code: Some(ErrorCode::RateLimited),
+            message: String::new(),
+        };
+        assert!(rate_limited.is_retryable());
+        let session = fresh_session(300, 60);
+        session.request_failed(session_verdict(Some(ErrorCode::RateLimited)));
+        assert!(is_active(&session));
+        session.request_failed(session_verdict(Some(ErrorCode::SessionRevoked)));
+        assert_eq!(session.dead_reason(), Some(DeadReason::Revoked));
+    }
+
+    #[test]
+    fn retry_backoff_doubles_to_thirty_seconds_and_stays_inside_grace() {
+        let secs = |s: f64| StdDuration::from_secs_f64(s);
+        let expected = [
+            (1, 1.0, secs(1.0)),
+            (1, 0.0, secs(0.5)),
+            (2, 1.0, secs(2.0)),
+            (3, 1.0, secs(4.0)),
+            (5, 1.0, secs(16.0)),
+            (5, 0.5, secs(12.0)),
+            (6, 1.0, secs(30.0)),
+            (6, 0.0, secs(15.0)),
+            (40, 1.0, secs(30.0)),
+        ];
+        for (attempt, jitter, delay) in expected {
+            assert_eq!(retry_delay(attempt, jitter), delay, "attempt {attempt}");
+        }
+
+        let session = fresh_session(300, 5);
+        session.heartbeat_failed(Verdict::Transient);
+        let deadline = instant_of(&session, grace_deadline(&session));
+        for _ in 0..12 {
+            let due = session.next_heartbeat_due().expect("alive in grace");
+            assert!(due <= deadline);
+            session.heartbeat_failed(Verdict::Transient);
+        }
+        assert_eq!(session.next_heartbeat_due(), Some(deadline));
+    }
+
+    #[test]
+    fn renewal_respects_the_floor_and_stops_when_the_lease_stops_growing() {
+        let now = Utc::now();
+        let session = session_on(
+            SessionClock::starting_at(now),
+            lease_at(now, 100, 60),
+            Vec::new(),
+        );
+        assert_eq!(
+            session.next_heartbeat_due(),
+            Some(instant_of(&session, now + Duration::seconds(80)))
+        );
+
+        // Near the grant's end a renewal extends the lease to only 12 s:
+        // 80% is 9.6 s, below the floor of a tenth of the 100 s lease.
+        let granted = now + Duration::seconds(95);
+        session.install_lease(lease_at(granted, 12, 60), Vec::new(), granted);
+        assert_eq!(
+            session.next_heartbeat_due(),
+            Some(instant_of(&session, granted + Duration::seconds(10)))
+        );
+
+        // A renewal that ends where the previous lease ended: sleep to expiry.
+        let renewed = granted + Duration::seconds(10);
+        let same_end = Lease {
+            session_id: Uuid::nil(),
+            granted_at: renewed,
+            expires_at: granted + Duration::seconds(12),
+            grace_period: Duration::seconds(60),
+        };
+        session.install_lease(same_end, Vec::new(), renewed);
+        assert_eq!(
+            session.next_heartbeat_due(),
+            Some(instant_of(&session, granted + Duration::seconds(12)))
         );
     }
 }
