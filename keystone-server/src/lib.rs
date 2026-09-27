@@ -16,6 +16,7 @@ pub(crate) mod downloads;
 pub mod entitlement;
 pub mod error;
 pub mod limiter;
+pub mod protector;
 pub mod revocations;
 pub mod routes;
 pub mod serve;
@@ -24,10 +25,13 @@ pub mod store;
 pub mod tls;
 
 pub use audit::{AuditEvent, AuditSink, TracingAudit};
-pub use config::{AdminToken, AdminTokenError, PayloadConfig, RateLimits, ServerConfig};
+pub use config::{
+    AdminToken, AdminTokenError, PayloadConfig, ProtectorConfig, RateLimits, ServerConfig,
+};
 pub use error::ServerError;
 pub use keystone_core::BackendError;
 pub use limiter::{MemoryLimiter, RateLimiter};
+pub use protector::watermark_bytes;
 pub use revocations::{FileRevocationStore, MemoryRevocations, RevocationStore};
 pub use routes::{admin_router, public_router};
 pub use serve::{Listeners, serve};

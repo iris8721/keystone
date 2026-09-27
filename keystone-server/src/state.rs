@@ -15,6 +15,7 @@ use crate::config::{AdminToken, PayloadConfig, RateLimits};
 use crate::downloads::DownloadLog;
 use crate::error::ServerError;
 use crate::limiter::{MemoryLimiter, RateLimiter};
+use crate::protector::MutationCache;
 use crate::revocations::{MemoryRevocations, RevocationStore};
 use crate::store::{MemoryStore, SessionStore};
 
@@ -47,6 +48,7 @@ pub(crate) struct Inner {
     pub(crate) require_client_certificates: bool,
     pub(crate) payloads: Option<PayloadConfig>,
     pub(crate) downloads: Option<DownloadLog>,
+    pub(crate) mutations: MutationCache,
     pub(crate) verifier: SecretVerifier,
     pub(crate) publish: Arc<tokio::sync::Mutex<()>>,
     revoked_key_ids: RwLock<BTreeSet<u8>>,
@@ -259,6 +261,7 @@ impl AppStateBuilder {
                 require_client_certificates: self.require_client_certificates,
                 payloads: self.payloads,
                 downloads,
+                mutations: MutationCache::default(),
                 verifier: SecretVerifier::new(),
                 publish: Arc::new(tokio::sync::Mutex::new(())),
                 revoked_key_ids: RwLock::new(revoked),
@@ -361,6 +364,7 @@ impl AppState {
     pub async fn sweep(&self) -> Result<usize, ServerError> {
         let now = Utc::now();
         self.inner.limiter.evict(std::time::Instant::now()).await;
+        self.inner.mutations.sweep(now);
         self.inner
             .fingerprints
             .lock()

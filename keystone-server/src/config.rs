@@ -121,6 +121,19 @@ impl fmt::Debug for AdminToken {
     }
 }
 
+/// The external protector run over each fetched artifact (see
+/// [`crate::protector`]). `KEYSTONE_PROTECTOR_SCRIPT` names the script; a
+/// `.ps1` runs through PowerShell, anything else executes directly. The
+/// invocation is `script -In <in> -Out <out> -Passes light`.
+#[derive(Debug, Clone)]
+pub struct ProtectorConfig {
+    /// Protector script path; must exist at configuration time.
+    pub script: PathBuf,
+    /// Hex pattern locating the reserved watermark region in the plaintext;
+    /// `None` disables watermarking.
+    pub watermark_pattern: Option<Vec<u8>>,
+}
+
 /// Where sealed releases live and the secrets that key them. Artifacts are
 /// `{dir}/{product}/{version}.bin` with `.sha256` and `.build` sidecars.
 #[derive(Clone)]
@@ -133,6 +146,8 @@ pub struct PayloadConfig {
     pub epoch: u32,
     /// Keys manifest download ids and download log pseudonyms.
     pub watermark_secret: Zeroizing<[u8; 32]>,
+    /// Per-download artifact mutation; `None` serves stored bytes as-is.
+    pub protector: Option<ProtectorConfig>,
 }
 
 impl PayloadConfig {
@@ -144,12 +159,19 @@ impl PayloadConfig {
             secret: Zeroizing::new(secret),
             epoch,
             watermark_secret,
+            protector: None,
         }
     }
 
     /// Replace the derived watermark secret.
     pub fn with_watermark_secret(mut self, watermark_secret: [u8; 32]) -> Self {
         self.watermark_secret = Zeroizing::new(watermark_secret);
+        self
+    }
+
+    /// Enable per-download artifact mutation.
+    pub fn with_protector(mut self, protector: ProtectorConfig) -> Self {
+        self.protector = Some(protector);
         self
     }
 }
@@ -511,7 +533,11 @@ impl Env<'_> {
         let (dir, secret_file) = match (dir, secret_file) {
             (Some(dir), Some(file)) => (dir, file),
             (None, None) => {
-                for var in ["KEYSTONE_PAYLOAD_EPOCH", "KEYSTONE_WATERMARK_SECRET"] {
+                for var in [
+                    "KEYSTONE_PAYLOAD_EPOCH",
+                    "KEYSTONE_WATERMARK_SECRET",
+                    "KEYSTONE_PROTECTOR_SCRIPT",
+                ] {
                     if (self.0)(var).is_some() {
                         return Err(ServerError::config(var, "requires KEYSTONE_PAYLOAD_DIR"));
                     }
@@ -551,7 +577,48 @@ impl Env<'_> {
             })?;
             config = config.with_watermark_secret(watermark);
         }
+        if let Some(protector) = self.protector()? {
+            config = config.with_protector(protector);
+        }
         Ok(Some(config))
+    }
+
+    /// `KEYSTONE_PROTECTOR_SCRIPT` plus optional
+    /// `KEYSTONE_PROTECTOR_WATERMARK_PATTERN` (hex). The script must exist;
+    /// the pattern requires the script.
+    fn protector(&self) -> Result<Option<ProtectorConfig>, ServerError> {
+        const SCRIPT: &str = "KEYSTONE_PROTECTOR_SCRIPT";
+        const PATTERN: &str = "KEYSTONE_PROTECTOR_WATERMARK_PATTERN";
+        let Some(script) = self.path(SCRIPT) else {
+            if (self.0)(PATTERN).is_some() {
+                return Err(ServerError::config(
+                    PATTERN,
+                    "requires KEYSTONE_PROTECTOR_SCRIPT",
+                ));
+            }
+            return Ok(None);
+        };
+        if !script.is_file() {
+            return Err(ServerError::config(
+                SCRIPT,
+                format!("{} does not exist", script.display()),
+            ));
+        }
+        let watermark_pattern = match self.text(PATTERN)? {
+            Some(text) => {
+                let bytes = hex::decode(text.trim())
+                    .map_err(|_| ServerError::config(PATTERN, "must be hexadecimal"))?;
+                if bytes.is_empty() {
+                    return Err(ServerError::config(PATTERN, "must not be empty"));
+                }
+                Some(bytes)
+            }
+            None => None,
+        };
+        Ok(Some(ProtectorConfig {
+            script,
+            watermark_pattern,
+        }))
     }
 
     /// `KEYSTONE_ADMIN_CERT_SHA256`: comma-separated 64-character hex hashes.
@@ -655,6 +722,89 @@ mod tests {
             Err(other) => panic!("expected a Config error, got {other}"),
             Ok(_) => panic!("expected a Config error, got a config"),
         }
+    }
+
+    #[test]
+    fn protector_settings_validate() {
+        let dir = std::env::temp_dir().join(format!("keystone-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, [1u8; 32]).unwrap();
+        let script = dir.join("protect.ps1");
+        std::fs::write(&script, b"#").unwrap();
+        fn payload_vars<'a>(
+            dir: &'a str,
+            secret: &'a str,
+            script: Option<&'a str>,
+            pattern: Option<&'a str>,
+        ) -> Vec<(&'a str, &'a str)> {
+            let mut vars: Vec<(&'a str, &'a str)> = vec![
+                ("KEYSTONE_ALLOW_INSECURE", "1"),
+                ("KEYSTONE_PAYLOAD_DIR", dir),
+                ("KEYSTONE_PAYLOAD_SECRET_FILE", secret),
+            ];
+            if let Some(script) = script {
+                vars.push(("KEYSTONE_PROTECTOR_SCRIPT", script));
+            }
+            if let Some(pattern) = pattern {
+                vars.push(("KEYSTONE_PROTECTOR_WATERMARK_PATTERN", pattern));
+            }
+            vars
+        }
+        let (dir_s, secret_s, script_s) = (
+            dir.to_str().unwrap(),
+            secret.to_str().unwrap(),
+            script.to_str().unwrap(),
+        );
+
+        // Script without a payload dir names itself.
+        let vars: Vec<(&str, &str)> = [
+            ("KEYSTONE_ALLOW_INSECURE", "1"),
+            ("KEYSTONE_PROTECTOR_SCRIPT", script_s),
+        ]
+        .into();
+        assert_eq!(config_var(config(&vars)), "KEYSTONE_PROTECTOR_SCRIPT");
+
+        // Pattern without a script.
+        let vars = payload_vars(dir_s, secret_s, None, Some("4b455953544f4e45"));
+        assert_eq!(
+            config_var(config(&vars)),
+            "KEYSTONE_PROTECTOR_WATERMARK_PATTERN"
+        );
+
+        // Missing script file.
+        let vars = payload_vars(dir_s, secret_s, Some("no-such-protector.ps1"), None);
+        assert_eq!(config_var(config(&vars)), "KEYSTONE_PROTECTOR_SCRIPT");
+
+        // Non-hex and empty patterns.
+        for bad in ["nothex", ""] {
+            let vars = payload_vars(dir_s, secret_s, Some(script_s), Some(bad));
+            assert_eq!(
+                config_var(config(&vars)),
+                "KEYSTONE_PROTECTOR_WATERMARK_PATTERN",
+                "{bad:?}"
+            );
+        }
+
+        // A valid pair lands in the payload config.
+        let cfg = config(&payload_vars(
+            dir_s,
+            secret_s,
+            Some(script_s),
+            Some("4b455953544f4e45"),
+        ))
+        .unwrap();
+        let payloads = cfg.payloads.expect("payloads configured");
+        let protector = payloads.protector.expect("protector configured");
+        assert_eq!(protector.script, script);
+        assert_eq!(protector.watermark_pattern, Some(b"KEYSTONE".to_vec()));
+
+        // A script alone works; no pattern means no watermarking.
+        let cfg = config(&payload_vars(dir_s, secret_s, Some(script_s), None)).unwrap();
+        assert_eq!(
+            cfg.payloads.unwrap().protector.unwrap().watermark_pattern,
+            None
+        );
     }
 
     #[test]

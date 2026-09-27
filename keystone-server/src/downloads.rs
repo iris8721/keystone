@@ -32,6 +32,16 @@ pub enum PayloadRoute {
     BlobServed,
 }
 
+/// Mutation facts a download record adds when the artifact was mutated at
+/// fetch: the sha256 the manifest attests and whether the watermark was
+/// applied.
+pub(crate) struct MutationInfo {
+    /// sha256 of the mutated plaintext.
+    pub sha256: [u8; 32],
+    /// Whether the watermark pattern was found and patched.
+    pub watermarked: bool,
+}
+
 #[derive(Serialize)]
 struct DownloadRecord<'a> {
     #[serde(with = "keystone_core::wire::millis")]
@@ -42,6 +52,10 @@ struct DownloadRecord<'a> {
     build_id: &'a str,
     session_tag: &'a str,
     route: PayloadRoute,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mutated_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watermarked: Option<bool>,
 }
 
 /// Append-only JSONL download log, owner-only on every platform. Reopens the
@@ -50,6 +64,26 @@ struct DownloadRecord<'a> {
 pub struct DownloadLog {
     tx: SyncSender<Vec<u8>>,
     secret: Zeroizing<[u8; 32]>,
+}
+
+/// One queued record: what happened, for whom, and — for a mutated
+/// fetch — the sha the manifest attests and whether the watermark was
+/// applied.
+pub(crate) struct DownloadContext<'a> {
+    /// Which payload route produced the record.
+    pub route: PayloadRoute,
+    /// Account name (pseudonymized inside).
+    pub account: &'a str,
+    /// Product name.
+    pub product: &'a str,
+    /// Release version.
+    pub version: &'a str,
+    /// Release build id.
+    pub build_id: &'a str,
+    /// Pseudonymous session tag.
+    pub session_tag: &'a str,
+    /// Mutation facts; `None` on the unmutated path.
+    pub mutation: Option<&'a MutationInfo>,
 }
 
 impl DownloadLog {
@@ -79,15 +113,16 @@ impl DownloadLog {
 
     /// Queue one record. Never blocks: when the writer is behind by more
     /// than the queue depth the record is dropped with a warning.
-    pub fn record(
-        &self,
-        route: PayloadRoute,
-        account: &str,
-        product: &str,
-        version: &str,
-        build_id: &str,
-        session_tag: &str,
-    ) {
+    pub fn record(&self, ctx: DownloadContext<'_>) {
+        let DownloadContext {
+            route,
+            account,
+            product,
+            version,
+            build_id,
+            session_tag,
+            mutation,
+        } = ctx;
         let record = DownloadRecord {
             ts: Utc::now(),
             account_pseudonym: self.account_pseudonym(account),
@@ -96,6 +131,8 @@ impl DownloadLog {
             build_id,
             session_tag,
             route,
+            mutated_sha256: mutation.map(|m| hex::encode(m.sha256)),
+            watermarked: mutation.map(|m| m.watermarked),
         };
         let mut line = match serde_json::to_vec(&record) {
             Ok(line) => line,
@@ -197,14 +234,15 @@ mod tests {
     }
 
     fn record(log: &DownloadLog, version: &str) {
-        log.record(
-            PayloadRoute::BlobServed,
-            "dev",
-            "dev-product",
+        log.record(DownloadContext {
+            route: PayloadRoute::BlobServed,
+            account: "dev",
+            product: "dev-product",
             version,
-            "build-1",
-            "0011223344556677",
-        );
+            build_id: "build-1",
+            session_tag: "0011223344556677",
+            mutation: None,
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

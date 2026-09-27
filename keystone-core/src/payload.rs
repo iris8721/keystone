@@ -120,13 +120,26 @@ pub fn seal_artifact(
     context: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    check_plaintext_len(plaintext.len())?;
     let nonce = XChaCha20Poly1305::generate_nonce(&mut rand::thread_rng());
     let nonce_bytes: [u8; SEALED_PREFIX_LEN] = nonce.into();
     let key = artifact_key_from_prefix(artifact_secret, context, &nonce_bytes);
-    let ciphertext = XChaCha20Poly1305::new((&*key).into())
-        .encrypt(&nonce, plaintext)
+    seal_with(&key, &nonce, plaintext)
+}
+
+/// Seal plaintext under a caller-held key (one already wrapped for a
+/// session) with a fresh nonce. Same format and length rules as
+/// [`seal_artifact`]; unlike it, the key does not depend on the nonce.
+pub fn seal_under(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut rand::thread_rng());
+    seal_with(key, &nonce, plaintext)
+}
+
+fn seal_with(key: &[u8; 32], nonce: &XNonce, plaintext: &[u8]) -> Result<Vec<u8>> {
+    check_plaintext_len(plaintext.len())?;
+    let ciphertext = XChaCha20Poly1305::new(key.into())
+        .encrypt(nonce, plaintext)
         .map_err(|_| KeystoneError::Malformed("artifact seal failed".into()))?;
+    let nonce_bytes: [u8; SEALED_PREFIX_LEN] = (*nonce).into();
     let mut out = Vec::with_capacity(SEALED_PREFIX_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
@@ -274,6 +287,20 @@ mod tests {
             decrypt_artifact(&key, &sealed).unwrap().as_slice(),
             b"bytes"
         );
+    }
+
+    #[test]
+    fn seal_under_round_trips_under_the_callers_key() {
+        let key = [9u8; 32];
+        let sealed = seal_under(&key, b"mutated bytes").unwrap();
+        assert_eq!(
+            decrypt_artifact(&key, &sealed).unwrap().as_slice(),
+            b"mutated bytes"
+        );
+        assert!(matches!(
+            decrypt_artifact(&[8u8; 32], &sealed),
+            Err(KeystoneError::InvalidMac)
+        ));
     }
 
     #[test]

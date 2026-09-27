@@ -95,6 +95,13 @@ impl ApiError {
     }
 }
 
+/// An unusable artifact: the stored release or its mutation failed to
+/// open, decrypt, or seal. The detail is logged, never sent.
+pub(crate) fn artifact_invalid(detail: impl std::fmt::Display) -> ApiError {
+    tracing::error!(%detail, "artifact invalid");
+    ApiError::new(ErrorCode::ArtifactInvalid, "artifact is unusable")
+}
+
 /// The one mapping from wire code to HTTP status.
 pub(crate) fn status_for(code: ErrorCode) -> StatusCode {
     match code {

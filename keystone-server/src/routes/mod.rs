@@ -15,7 +15,7 @@ use crate::state::AppState;
 
 mod admin;
 mod attest;
-mod common;
+pub(crate) mod common;
 mod exchange;
 mod handoff;
 mod heartbeat;
