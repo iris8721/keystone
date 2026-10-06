@@ -23,9 +23,9 @@ use keystone_core::wire::{
     mac_context,
 };
 use keystone_core::{
-    AccountIdentity, BackendError, Challenge, Entitlement, EntitlementSource, Envelope,
-    Expectation, Issuer, RequestBinding, TrustedIssuers, handoff_wrap_key, mac_request,
-    unwrap_secret,
+    AccountIdentity, AccountSummary, BackendError, Challenge, Entitlement, EntitlementSource,
+    Envelope, Expectation, GrantSummary, Issuer, RequestBinding, TrustedIssuers, handoff_wrap_key,
+    mac_request, unwrap_secret,
 };
 use keystone_server::{
     AppState, AppStateBuilder, AuditEvent, AuditSink, HandoffRecord, Listeners, MemoryStore,
@@ -60,6 +60,7 @@ struct Account {
     secret: String,
     grants: Vec<Entitlement>,
     pin: Option<[u8; 32]>,
+    hwid_lock: Option<[u8; 32]>,
 }
 
 /// Plain-comparison entitlement source whose grants and pins tests can
@@ -70,6 +71,7 @@ pub struct TestSource {
     accounts: RwLock<HashMap<String, Account>>,
     down: AtomicBool,
     authentications: AtomicUsize,
+    binds_machines: AtomicBool,
 }
 
 impl TestSource {
@@ -91,6 +93,7 @@ impl TestSource {
                 secret: secret.to_string(),
                 grants,
                 pin: None,
+                hwid_lock: None,
             },
         );
     }
@@ -101,6 +104,22 @@ impl TestSource {
 
     pub fn pin(&self, account: &str, cert_sha256: [u8; 32]) {
         self.accounts.write().get_mut(account).unwrap().pin = Some(cert_sha256);
+    }
+
+    /// Answer the machine-binding calls instead of reporting, like the
+    /// trait defaults, that this backend does not bind machines.
+    pub fn bind_machines(&self) {
+        self.binds_machines.store(true, Ordering::SeqCst);
+    }
+
+    /// The machine lock the account holds, if any.
+    pub fn hwid_lock(&self, account: &str) -> Option<[u8; 32]> {
+        self.accounts.read().get(account).and_then(|a| a.hwid_lock)
+    }
+
+    /// Bind or clear the lock out of band.
+    pub fn set_hwid_lock(&self, account: &str, lock: Option<[u8; 32]>) {
+        self.accounts.write().get_mut(account).unwrap().hwid_lock = lock;
     }
 
     pub fn set_down(&self, down: bool) {
@@ -156,6 +175,51 @@ impl EntitlementSource for TestSource {
     async fn cert_sha256(&self, account: &str) -> Result<Option<[u8; 32]>, BackendError> {
         self.check_up()?;
         Ok(self.accounts.read().get(account).and_then(|a| a.pin))
+    }
+
+    async fn bind_hwid(
+        &self,
+        account: &str,
+        hwid_hash: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, BackendError> {
+        self.check_up()?;
+        if !self.binds_machines.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let mut accounts = self.accounts.write();
+        Ok(accounts
+            .get_mut(account)
+            .map(|a| *a.hwid_lock.get_or_insert(hwid_hash)))
+    }
+
+    async fn clear_hwid_lock(&self, account: &str) -> Result<Option<bool>, BackendError> {
+        self.check_up()?;
+        if !self.binds_machines.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let mut accounts = self.accounts.write();
+        Ok(accounts
+            .get_mut(account)
+            .map(|a| a.hwid_lock.take().is_some()))
+    }
+
+    async fn account_summary(&self, account: &str) -> Result<Option<AccountSummary>, BackendError> {
+        self.check_up()?;
+        if !self.binds_machines.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let accounts = self.accounts.read();
+        Ok(accounts.get(account).map(|a| AccountSummary {
+            hwid_locked: a.hwid_lock.is_some(),
+            grants: a
+                .grants
+                .iter()
+                .map(|g| GrantSummary {
+                    product: g.product.clone(),
+                    expires_at: g.expires_at,
+                })
+                .collect(),
+        }))
     }
 }
 

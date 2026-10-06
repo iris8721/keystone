@@ -12,8 +12,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Json;
 use http_body_util::BodyExt;
 use keystone_core::wire::{
-    ADMIN_TOKEN_HEADER, BUILD_ID_HEADER, ErrorCode, PublishBody, RevokeBody, RevokeRequest,
-    RevokeTarget, validate_build_id, validate_release,
+    ADMIN_TOKEN_HEADER, AccountGrantInfo, AccountInfoBody, BUILD_ID_HEADER, ErrorCode,
+    HwidResetBody, HwidResetRequest, PublishBody, RevokeBody, RevokeRequest, RevokeTarget,
+    validate_build_id, validate_release,
 };
 use keystone_core::{ArtifactPaths, MAX_PLAINTEXT_BYTES, artifact_context, fs, seal_artifact};
 use sha2::{Digest, Sha256};
@@ -41,6 +42,84 @@ pub(crate) async fn revoke(
     }
     .map_err(ApiError::from_server)?;
     Ok(Json(RevokeBody { revoked }))
+}
+
+/// Clear an account's machine binding; the next exchange binds anew.
+/// Unknown accounts are 404. A reset that actually cleared a lock also
+/// revokes the account's sessions: otherwise the old machine would keep
+/// its lease alive through heartbeats, which never recheck the lock, while
+/// the new machine binds on its own exchange.
+///
+/// The lock is cleared before the revocation. The clear is what lets the
+/// new machine bind, and [`AppState::revoke_account`] bumps the account
+/// epoch first, so an exchange racing this handler is revoked too and
+/// cannot keep a live session on the old machine.
+pub(crate) async fn hwid_reset(
+    State(state): State<AppState>,
+    peer: Peer,
+    WireJson(req): WireJson<HwidResetRequest>,
+) -> Result<Json<HwidResetBody>, ApiError> {
+    require_admin_certificate(&state, &peer)?;
+    req.validate().map_err(ApiError::bad_request)?;
+    require_admin_token(&state, &peer, &req.admin_token).await?;
+    let was_locked = state
+        .inner
+        .entitlements
+        .clear_hwid_lock(&req.account)
+        .await
+        .map_err(ApiError::backend)?
+        .ok_or_else(unknown_account)?;
+    state.audit(AuditEvent::HwidReset {
+        account: req.account.clone(),
+    });
+    if was_locked {
+        state
+            .revoke_account(&req.account)
+            .await
+            .map_err(ApiError::from_server)?;
+    }
+    Ok(Json(HwidResetBody {
+        account: req.account,
+        was_locked,
+    }))
+}
+
+/// The operator view of one account: lock state and every grant.
+pub(crate) async fn account_info(
+    State(state): State<AppState>,
+    peer: Peer,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AccountInfoBody>, ApiError> {
+    require_admin_certificate(&state, &peer)?;
+    let token = headers
+        .get(ADMIN_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    require_admin_token(&state, &peer, token).await?;
+    let summary = state
+        .inner
+        .entitlements
+        .account_summary(&name)
+        .await
+        .map_err(ApiError::backend)?
+        .ok_or_else(unknown_account)?;
+    Ok(Json(AccountInfoBody {
+        name,
+        hwid_locked: summary.hwid_locked,
+        entitlements: summary
+            .grants
+            .into_iter()
+            .map(|g| AccountGrantInfo {
+                product: g.product,
+                expires_at: g.expires_at,
+            })
+            .collect(),
+    }))
+}
+
+fn unknown_account() -> ApiError {
+    ApiError::new(ErrorCode::BadRequest, "no such account").with_status(StatusCode::NOT_FOUND)
 }
 
 /// Seal and store a new release. Releases are immutable: an existing

@@ -3,5 +3,6 @@
 mod client_flow;
 mod common;
 mod handoff;
+mod hwid;
 mod payload;
 mod tls_pin;

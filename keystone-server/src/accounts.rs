@@ -16,7 +16,10 @@ use argon2::password_hash::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use keystone_core::{AccountFile, AccountIdentity, BackendError, Entitlement, EntitlementSource};
+use keystone_core::{
+    AccountFile, AccountIdentity, AccountSummary, BackendError, Entitlement, EntitlementSource,
+    GrantSummary,
+};
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
@@ -93,6 +96,7 @@ pub struct LocalAccounts {
     verifier: SecretVerifier,
     snapshot: Arc<ArcSwap<Snapshot>>,
     refreshing: Arc<AtomicBool>,
+    write: tokio::sync::Mutex<()>,
 }
 
 impl LocalAccounts {
@@ -108,6 +112,7 @@ impl LocalAccounts {
             verifier: SecretVerifier::new(),
             snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
             refreshing: Arc::new(AtomicBool::new(false)),
+            write: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -141,6 +146,51 @@ impl LocalAccounts {
             .loaded
             .clone()
             .map_err(|e| BackendError::from(e.to_string()))
+    }
+
+    /// Replace the accounts file with `file` on disk, then publish it.
+    /// Callers hold the write lock, so mutations never interleave; an
+    /// external edit that lands between a caller's read and this write is
+    /// overwritten, the same trade the reload loop already makes.
+    async fn persist(&self, file: AccountFile) -> Result<(), BackendError> {
+        let file = Arc::new(file);
+        let path = self.path.clone();
+        let written = file.clone();
+        tokio::task::spawn_blocking(move || written.save(&path))
+            .await
+            .map_err(|e| BackendError::from(e.to_string()))?
+            .map_err(|e| BackendError::from(e.to_string()))?;
+        self.snapshot.store(Arc::new(Snapshot {
+            loaded: Ok(file),
+            stamp: stamp(&self.path),
+            checked_at: Instant::now(),
+        }));
+        Ok(())
+    }
+
+    /// Run `mutate` on a fresh copy of the account and persist only when
+    /// its `changed` flag is set. `None` when there is no such account.
+    async fn mutate<T>(
+        &self,
+        account: &str,
+        mutate: impl FnOnce(&mut keystone_core::AccountRecord) -> (T, bool),
+    ) -> Result<Option<T>, BackendError> {
+        let _write = self.write.lock().await;
+        let file = self.current().await?;
+        if !file.accounts.iter().any(|a| a.name == account) {
+            return Ok(None);
+        }
+        let mut next = (*file).clone();
+        let record = next
+            .accounts
+            .iter_mut()
+            .find(|a| a.name == account)
+            .expect("checked above");
+        let (outcome, changed) = mutate(record);
+        if changed {
+            self.persist(next).await?;
+        }
+        Ok(Some(outcome))
     }
 }
 
@@ -233,5 +283,47 @@ impl EntitlementSource for LocalAccounts {
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
             .ok_or_else(|| BackendError::from("cert_sha256 is not 64 hex characters"))?;
         Ok(Some(hash))
+    }
+
+    async fn bind_hwid(
+        &self,
+        account: &str,
+        hwid_hash: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, BackendError> {
+        self.mutate(account, |record| match record.hwid_lock {
+            Some(lock) => (lock, false),
+            None => {
+                record.hwid_lock = Some(hwid_hash);
+                (hwid_hash, true)
+            }
+        })
+        .await
+    }
+
+    async fn clear_hwid_lock(&self, account: &str) -> Result<Option<bool>, BackendError> {
+        self.mutate(account, |record| {
+            let was_locked = record.hwid_lock.take().is_some();
+            (was_locked, was_locked)
+        })
+        .await
+    }
+
+    async fn account_summary(&self, account: &str) -> Result<Option<AccountSummary>, BackendError> {
+        let file = self.current().await?;
+        Ok(file
+            .accounts
+            .iter()
+            .find(|a| a.name == account)
+            .map(|a| AccountSummary {
+                hwid_locked: a.hwid_lock.is_some(),
+                grants: a
+                    .entitlements
+                    .iter()
+                    .map(|g| GrantSummary {
+                        product: g.product.clone(),
+                        expires_at: g.expires_at,
+                    })
+                    .collect(),
+            }))
     }
 }

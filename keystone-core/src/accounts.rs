@@ -36,6 +36,10 @@ pub struct AccountRecord {
     /// to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_sha256: Option<String>,
+    /// sha256 of the machine fingerprint this account is bound to, set on
+    /// the first exchange; `None` until then or after an admin reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwid_lock: Option<[u8; 32]>,
 }
 
 /// A product grant as stored in the file; the account is the record
@@ -80,6 +84,7 @@ impl fmt::Debug for AccountRecord {
             .field("secret_hash", &"[redacted]")
             .field("entitlements", &self.entitlements)
             .field("cert_sha256", &self.cert_sha256)
+            .field("hwid_lock", &self.hwid_lock)
             .finish_non_exhaustive()
     }
 }

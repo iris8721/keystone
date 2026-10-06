@@ -31,7 +31,9 @@ pub use crypto::{
     Issuer, KEYFILE_LEN, REQUEST_SKEW, RequestBinding, artifact_context, check_request_freshness,
     derive_watermark_secret, mac_request, request_nonce_expiry, verify_request_mac,
 };
-pub use entitlement::{AccountIdentity, Entitlement, EntitlementSource};
+pub use entitlement::{
+    AccountIdentity, AccountSummary, Entitlement, EntitlementSource, GrantSummary,
+};
 pub use envelope::{BootstrapExpectation, Envelope, Expectation, IssueSpec};
 pub use error::{BackendError, KeystoneError, Result};
 pub use handoff::{HandoffPayload, HandoffToken, handoff_wrap_key};

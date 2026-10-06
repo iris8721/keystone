@@ -75,6 +75,13 @@ pub mod paths {
     pub const PAYLOAD: &str = "/payload";
     /// `POST` on the admin listener: [`super::RevokeRequest`].
     pub const REVOKE: &str = "/revoke";
+    /// `POST` on the admin listener: [`super::HwidResetRequest`].
+    pub const HWID_RESET: &str = "/hwid-reset";
+
+    /// `GET` on the admin listener: [`super::AccountInfoBody`] for `name`.
+    pub fn account(name: &str) -> String {
+        format!("/accounts/{name}")
+    }
 
     /// `GET` path of a sealed artifact, authorized by a
     /// [`super::DownloadAuthorization`] header. Callers pass values that
@@ -153,6 +160,9 @@ pub enum ErrorCode {
     GraceExhausted,
     /// The account holds no grant for the product.
     NoEntitlement,
+    /// The request's machine fingerprint does not match the account's
+    /// bound HWID.
+    HwidMismatch,
     /// The request names a product other than the session's.
     WrongProduct,
     /// The handoff is unknown, spent, expired, or bound elsewhere.
@@ -202,6 +212,7 @@ impl ErrorCode {
             ErrorCode::SessionExpired => "session_expired",
             ErrorCode::GraceExhausted => "grace_exhausted",
             ErrorCode::NoEntitlement => "no_entitlement",
+            ErrorCode::HwidMismatch => "hwid_mismatch",
             ErrorCode::WrongProduct => "wrong_product",
             ErrorCode::HandoffInvalid => "handoff_invalid",
             ErrorCode::ArtifactNotFound => "artifact_not_found",
@@ -229,6 +240,7 @@ impl ErrorCode {
             "session_expired" => ErrorCode::SessionExpired,
             "grace_exhausted" => ErrorCode::GraceExhausted,
             "no_entitlement" => ErrorCode::NoEntitlement,
+            "hwid_mismatch" => ErrorCode::HwidMismatch,
             "wrong_product" => ErrorCode::WrongProduct,
             "handoff_invalid" => ErrorCode::HandoffInvalid,
             "artifact_not_found" => ErrorCode::ArtifactNotFound,
@@ -262,6 +274,7 @@ impl ErrorCode {
             ErrorCode::SessionExpired => Verdict::Kill(DeadReason::Expired),
             ErrorCode::GraceExhausted => Verdict::Kill(DeadReason::GraceExhausted),
             ErrorCode::InvalidCredentials
+            | ErrorCode::HwidMismatch
             | ErrorCode::WrongProduct
             | ErrorCode::HandoffInvalid
             | ErrorCode::ArtifactInvalid
@@ -672,6 +685,64 @@ pub struct RevokeBody {
     pub revoked: u64,
 }
 
+/// `POST /hwid-reset` on the admin listener: clear an account's machine
+/// binding so its next exchange binds anew.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct HwidResetRequest {
+    /// Operator credential.
+    pub admin_token: Zeroizing<String>,
+    /// Account whose HWID lock is cleared.
+    pub account: String,
+}
+
+impl HwidResetRequest {
+    /// Enforce the field caps.
+    pub fn validate(&self) -> Result<()> {
+        required("admin_token", &self.admin_token, MAX_ADMIN_TOKEN_BYTES)?;
+        validate_account(&self.account)
+    }
+}
+
+impl fmt::Debug for HwidResetRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HwidResetRequest")
+            .field("admin_token", &"[redacted]")
+            .field("account", &self.account)
+            .finish()
+    }
+}
+
+/// Response to an HWID reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HwidResetBody {
+    /// The account.
+    pub account: String,
+    /// Whether a lock was held before the reset.
+    pub was_locked: bool,
+}
+
+/// One grant as `GET /accounts/{name}` on the admin listener reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountGrantInfo {
+    /// Product granted.
+    pub product: String,
+    /// First instant at which the grant is dead.
+    #[serde(with = "millis")]
+    pub expires_at: DateTime<Utc>,
+}
+
+/// `GET /accounts/{name}` on the admin listener: the operator view of an
+/// account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountInfoBody {
+    /// Account name.
+    pub name: String,
+    /// Whether the account is bound to a machine fingerprint.
+    pub hwid_locked: bool,
+    /// Every grant, expired or not.
+    pub entitlements: Vec<AccountGrantInfo>,
+}
+
 /// A published release as the server stored it: the admin artifact
 /// publish endpoint's response body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -738,6 +809,12 @@ pub mod mac_context {
         buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(bytes);
     }
+}
+
+/// Check an account name: non-empty (`Malformed`) and within
+/// [`MAX_ACCOUNT_LEN`] (`FieldTooLong`).
+pub fn validate_account(name: &str) -> Result<()> {
+    required("account", name, MAX_ACCOUNT_LEN)
 }
 
 /// Check a build id: non-empty (`Malformed`), within [`MAX_BUILD_ID_LEN`]

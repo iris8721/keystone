@@ -735,6 +735,7 @@ fn error_code_wire_strings_and_verdicts() {
             Verdict::Kill(GraceExhausted),
         ),
         (C::NoEntitlement, "no_entitlement", Verdict::Kill(Revoked)),
+        (C::HwidMismatch, "hwid_mismatch", Verdict::RequestError),
         (C::WrongProduct, "wrong_product", Verdict::RequestError),
         (C::HandoffInvalid, "handoff_invalid", Verdict::RequestError),
         (
@@ -1245,6 +1246,7 @@ fn account_file_save_roundtrips() {
                 features: vec!["a".into()],
             }],
             cert_sha256: None,
+            hwid_lock: None,
         }],
     };
     file.save(&path).expect("save");
@@ -1272,6 +1274,106 @@ fn account_file_save_roundtrips() {
 }
 
 #[test]
+fn account_hwid_lock_roundtrips_and_defaults_to_unlocked() {
+    let dir = std::env::temp_dir().join(format!("keystone-accounts-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.json");
+
+    let file = AccountFile {
+        accounts: vec![AccountRecord {
+            name: "dev".into(),
+            secret_hash: "$argon2id$v=19$fake".into(),
+            entitlements: vec![],
+            cert_sha256: None,
+            hwid_lock: Some([0x5a; 32]),
+        }],
+    };
+    file.save(&path).expect("save");
+    assert_eq!(
+        AccountFile::load(&path).expect("load").accounts[0].hwid_lock,
+        Some([0x5a; 32])
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // A file written before machine binding existed still loads: unlocked.
+    let legacy = r#"{"accounts":[{"name":"dev","secret_hash":"$argon2id$v=19$fake",
+        "entitlements":[]}]}"#;
+    let parsed: AccountFile = serde_json::from_str(legacy).unwrap();
+    assert_eq!(parsed.accounts[0].hwid_lock, None);
+    // An unlocked account writes no key at all.
+    let json = serde_json::to_value(&parsed).unwrap();
+    assert!(json["accounts"][0].get("hwid_lock").is_none(), "{json}");
+}
+
+#[test]
+fn hwid_admin_bodies_are_wire_stable() {
+    let request = wire::HwidResetRequest {
+        admin_token: Zeroizing::new("admin-token-value".into()),
+        account: "dev".into(),
+    };
+    request.validate().unwrap();
+    assert!(!format!("{request:?}").contains("admin-token-value"));
+    assert!(matches!(
+        wire::HwidResetRequest {
+            account: "a".repeat(wire::MAX_ACCOUNT_LEN + 1),
+            ..request
+        }
+        .validate(),
+        Err(KeystoneError::FieldTooLong("account"))
+    ));
+    assert!(matches!(
+        wire::HwidResetRequest {
+            admin_token: Zeroizing::new("t".into()),
+            account: String::new(),
+        }
+        .validate(),
+        Err(KeystoneError::Malformed(_))
+    ));
+    assert!(matches!(
+        wire::validate_account(&"a".repeat(wire::MAX_ACCOUNT_LEN + 1)),
+        Err(KeystoneError::FieldTooLong("account"))
+    ));
+    wire::validate_account(&"a".repeat(wire::MAX_ACCOUNT_LEN)).unwrap();
+
+    let reset = wire::HwidResetBody {
+        account: "dev".into(),
+        was_locked: true,
+    };
+    assert_eq!(
+        serde_json::to_value(&reset).unwrap(),
+        serde_json::json!({ "account": "dev", "was_locked": true })
+    );
+
+    let expires_at = DateTime::from_timestamp_millis(1_900_000_000_123).unwrap();
+    let info = wire::AccountInfoBody {
+        name: "dev".into(),
+        hwid_locked: true,
+        entitlements: vec![wire::AccountGrantInfo {
+            product: "prod".into(),
+            expires_at,
+        }],
+    };
+    let json = serde_json::to_value(&info).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "name": "dev",
+            "hwid_locked": true,
+            "entitlements": [{ "product": "prod", "expires_at": 1_900_000_000_123i64 }],
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<wire::AccountInfoBody>(json).unwrap(),
+        info
+    );
+    assert_eq!(
+        serde_json::from_value::<wire::HwidResetBody>(serde_json::to_value(&reset).unwrap())
+            .unwrap(),
+        reset
+    );
+}
+
+#[test]
 fn account_debug_redacts_secret_hash() {
     let file = AccountFile {
         accounts: vec![AccountRecord {
@@ -1279,6 +1381,7 @@ fn account_debug_redacts_secret_hash() {
             secret_hash: "$argon2id$v=19$supersecrethash".into(),
             entitlements: vec![],
             cert_sha256: None,
+            hwid_lock: None,
         }],
     };
     let out = format!("{file:?}");

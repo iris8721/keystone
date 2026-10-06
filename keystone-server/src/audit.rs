@@ -30,6 +30,11 @@ pub enum AuditEvent {
         /// The account.
         account: String,
     },
+    /// An operator cleared an account's machine binding.
+    HwidReset {
+        /// The account.
+        account: String,
+    },
     /// A session minted a handoff.
     HandoffCreated {
         /// The minting session.
@@ -116,6 +121,11 @@ impl AuditSink for TracingAudit {
                 target: "keystone::audit",
                 account = %sanitize(&account),
                 "hwid anomaly: new fingerprint within window"
+            ),
+            AuditEvent::HwidReset { account } => tracing::info!(
+                target: "keystone::audit",
+                account = %sanitize(&account),
+                "hwid lock reset"
             ),
             AuditEvent::HandoffCreated { parent } => tracing::info!(
                 target: "keystone::audit",

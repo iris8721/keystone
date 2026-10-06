@@ -5,8 +5,9 @@ use std::fmt;
 use std::time::Duration;
 
 use keystone_core::wire::{
-    ADMIN_TOKEN_HEADER, BUILD_ID_HEADER, MAX_ADMIN_TOKEN_BYTES, PublishBody, RevokeBody,
-    RevokeRequest, RevokeTarget, paths, validate_build_id, validate_release,
+    ADMIN_TOKEN_HEADER, AccountInfoBody, BUILD_ID_HEADER, HwidResetBody, HwidResetRequest,
+    MAX_ADMIN_TOKEN_BYTES, PublishBody, RevokeBody, RevokeRequest, RevokeTarget, paths,
+    validate_account, validate_build_id, validate_release,
 };
 use keystone_core::{KeystoneError, MAX_PLAINTEXT_BYTES};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -106,7 +107,8 @@ impl AdminClientBuilder {
     }
 }
 
-/// Client for the admin listener: `/revoke` and artifact publishing.
+/// Client for the admin listener: `/revoke`, `/hwid-reset`,
+/// `GET /accounts/{name}`, and artifact publishing.
 #[derive(Clone)]
 pub struct AdminClient {
     transport: Transport,
@@ -155,6 +157,30 @@ impl AdminClient {
         };
         request.validate()?;
         accept_json(self.transport.post(paths::REVOKE, &request).await?).await
+    }
+
+    /// Clear `account`'s machine binding; its next exchange binds the new
+    /// machine. An unknown account is a 404 `bad_request` from the server.
+    pub async fn hwid_reset(&self, account: &str) -> Result<HwidResetBody, ClientError> {
+        let request = HwidResetRequest {
+            admin_token: self.admin_token.clone(),
+            account: account.to_owned(),
+        };
+        request.validate()?;
+        accept_json(self.transport.post(paths::HWID_RESET, &request).await?).await
+    }
+
+    /// The operator view of `account`: its HWID lock state and every grant.
+    /// An unknown account is a 404 `bad_request` from the server.
+    pub async fn account_info(&self, account: &str) -> Result<AccountInfoBody, ClientError> {
+        validate_account(account)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(ADMIN_TOKEN_HEADER),
+            self.token_header.clone(),
+        );
+        let path = paths::account(account);
+        accept_json(self.transport.get(&path, headers).await?).await
     }
 
     /// Publish plaintext `body` as release `product`/`version` with

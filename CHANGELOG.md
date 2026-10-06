@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Machine binding: the first successful exchange binds the account to the client's hwid; an exchange from another machine fails with `ErrorCode::HwidMismatch` (`hwid_mismatch`) and gets no session. `AccountRecord::hwid_lock` persists the lock in accounts files.
+- Admin `POST /hwid-reset` (`HwidResetRequest`, `HwidResetBody`) clears the lock and, when one was held, revokes the account's sessions so the old machine cannot keep running on heartbeats. Admin `GET /accounts/{name}` (`AccountInfoBody`, `AccountGrantInfo`) reports lock state and every grant.
+- `AdminClient::{hwid_reset, account_info}`.
+- `EntitlementSource::{bind_hwid, clear_hwid_lock, account_summary}` with defaults that do not bind, so existing backends keep their behaviour; `AccountSummary`, `GrantSummary`.
+
 ## 0.2.0
 
 Wire protocol 2. Not compatible with 0.1 clients, servers, key files or artifact layouts.

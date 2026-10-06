@@ -58,4 +58,50 @@ pub trait EntitlementSource: Send + Sync {
     async fn cert_sha256(&self, _account: &str) -> Result<Option<[u8; 32]>, BackendError> {
         Ok(None)
     }
+
+    /// Bind the account to `hwid_hash` when it has no machine lock yet and
+    /// return the lock now in force; `None` when this backend does not bind
+    /// machines (the default) or the account is unknown. A returned lock
+    /// that differs from `hwid_hash` is a rejection. The check-and-set must
+    /// be atomic so concurrent first exchanges cannot bind two machines.
+    async fn bind_hwid(
+        &self,
+        _account: &str,
+        _hwid_hash: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, BackendError> {
+        Ok(None)
+    }
+
+    /// Clear the account's machine lock. `None` for an unknown account,
+    /// otherwise whether a lock was held. Defaults to `None` (backend does
+    /// not bind machines).
+    async fn clear_hwid_lock(&self, _account: &str) -> Result<Option<bool>, BackendError> {
+        Ok(None)
+    }
+
+    /// Operator view of the account; `None` when there is no such account.
+    async fn account_summary(
+        &self,
+        _account: &str,
+    ) -> Result<Option<AccountSummary>, BackendError> {
+        Ok(None)
+    }
+}
+
+/// One grant as the operator account view reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSummary {
+    /// Product granted.
+    pub product: String,
+    /// First instant at which the grant is dead.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// What an operator may see of an account: no credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    /// Whether the account is bound to a machine fingerprint.
+    pub hwid_locked: bool,
+    /// Every grant, expired or not.
+    pub grants: Vec<GrantSummary>,
 }

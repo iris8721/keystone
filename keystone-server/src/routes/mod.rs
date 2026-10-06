@@ -52,12 +52,15 @@ pub fn public_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Operator routes: `POST /revoke` and `PUT /artifacts/{product}/{version}`
+/// Operator routes: `POST /revoke`, `POST /hwid-reset`,
+/// `GET /accounts/{name}`, and `PUT /artifacts/{product}/{version}`
 /// (plaintext body up to `MAX_ARTIFACT_BYTES`). Serve only on the admin
 /// listener, with the same connection requirements as [`public_router`].
 pub fn admin_router(state: AppState) -> Router {
     Router::new()
         .route(paths::REVOKE, post(admin::revoke))
+        .route(paths::HWID_RESET, post(admin::hwid_reset))
+        .route(&paths::account(":name"), get(admin::account_info))
         .route(
             &paths::artifact(":product", ":version"),
             put(admin::publish),

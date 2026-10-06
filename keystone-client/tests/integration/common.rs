@@ -13,7 +13,8 @@ use keystone_client::{
     AdminClient, ClientBuilder, ClientIdentity, ClientSession, KeystoneClient, TrustedIssuers,
 };
 use keystone_core::{
-    AccountIdentity, BackendError, Entitlement, EntitlementSource, Issuer, KEYFILE_LEN,
+    AccountIdentity, AccountSummary, BackendError, Entitlement, EntitlementSource, GrantSummary,
+    Issuer, KEYFILE_LEN,
 };
 use keystone_server::{AdminToken, AppState, AppStateBuilder, Listeners, serve};
 use parking_lot::RwLock;
@@ -45,6 +46,7 @@ pub fn grant(product: &str, features: &[&str]) -> Entitlement {
 pub struct TestSource {
     grants: RwLock<Vec<Entitlement>>,
     logins: AtomicUsize,
+    hwid_lock: RwLock<Option<[u8; 32]>>,
 }
 
 impl TestSource {
@@ -52,7 +54,13 @@ impl TestSource {
         Arc::new(Self {
             grants: RwLock::new(grants),
             logins: AtomicUsize::new(0),
+            hwid_lock: RwLock::new(None),
         })
+    }
+
+    /// The machine lock [`ACCOUNT`] holds, if any.
+    pub fn hwid_lock(&self) -> Option<[u8; 32]> {
+        *self.hwid_lock.read()
     }
 
     /// [`PRODUCT`] with feature `all`.
@@ -94,6 +102,42 @@ impl EntitlementSource for TestSource {
         }
         let grants = self.grants.read();
         Ok(grants.iter().find(|g| g.product == product).cloned())
+    }
+
+    async fn bind_hwid(
+        &self,
+        account: &str,
+        hwid_hash: [u8; 32],
+    ) -> Result<Option<[u8; 32]>, BackendError> {
+        if account != ACCOUNT {
+            return Ok(None);
+        }
+        Ok(Some(*self.hwid_lock.write().get_or_insert(hwid_hash)))
+    }
+
+    async fn clear_hwid_lock(&self, account: &str) -> Result<Option<bool>, BackendError> {
+        if account != ACCOUNT {
+            return Ok(None);
+        }
+        Ok(Some(self.hwid_lock.write().take().is_some()))
+    }
+
+    async fn account_summary(&self, account: &str) -> Result<Option<AccountSummary>, BackendError> {
+        if account != ACCOUNT {
+            return Ok(None);
+        }
+        Ok(Some(AccountSummary {
+            hwid_locked: self.hwid_lock.read().is_some(),
+            grants: self
+                .grants
+                .read()
+                .iter()
+                .map(|g| GrantSummary {
+                    product: g.product.clone(),
+                    expires_at: g.expires_at,
+                })
+                .collect(),
+        }))
     }
 }
 

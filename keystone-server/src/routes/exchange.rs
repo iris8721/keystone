@@ -90,6 +90,17 @@ pub(crate) async fn exchange(
     };
 
     let hwid_hash: [u8; 32] = Sha256::digest(req.hwid).into();
+    // The machine lock binds on the first exchange and gates every later
+    // one; the session is never created when the machine differs.
+    let lock = state
+        .inner
+        .entitlements
+        .bind_hwid(&req.account, hwid_hash)
+        .await
+        .map_err(ApiError::backend)?;
+    if lock.is_some_and(|lock| lock != hwid_hash) {
+        return Err(denied(&state, &req.account, ErrorCode::HwidMismatch));
+    }
     if state.hwid_anomaly(&req.account, hwid_hash, now) {
         state.audit(AuditEvent::HwidAnomaly {
             account: req.account.clone(),
@@ -166,6 +177,7 @@ fn denied(state: &AppState, account: &str, reason: ErrorCode) -> ApiError {
     let message = match reason {
         ErrorCode::RateLimited => "too many failed logins",
         ErrorCode::NoEntitlement => "no entitlement for product",
+        ErrorCode::HwidMismatch => "machine does not match the account's hwid lock",
         ErrorCode::SessionRevoked => "account revoked",
         _ => "invalid credentials",
     };

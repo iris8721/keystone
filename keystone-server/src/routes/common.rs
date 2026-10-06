@@ -115,6 +115,7 @@ pub(crate) fn status_for(code: ErrorCode) -> StatusCode {
         ErrorCode::UnknownSession | ErrorCode::ArtifactNotFound => StatusCode::NOT_FOUND,
         ErrorCode::SessionRevoked
         | ErrorCode::NoEntitlement
+        | ErrorCode::HwidMismatch
         | ErrorCode::WrongProduct
         | ErrorCode::Forbidden => StatusCode::FORBIDDEN,
         ErrorCode::SessionExpired | ErrorCode::GraceExhausted => StatusCode::GONE,

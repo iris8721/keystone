@@ -340,6 +340,21 @@ impl Transport {
         Ok(self.response(resp))
     }
 
+    /// GET with extra headers and return the raw response.
+    pub(crate) async fn get(
+        &self,
+        path: &str,
+        headers: HeaderMap,
+    ) -> Result<Response, ClientError> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .headers(headers)
+            .send()
+            .await?;
+        Ok(self.response(resp))
+    }
+
     /// GET an artifact with an `Authorization` header under the download
     /// timeout.
     pub(crate) async fn download(

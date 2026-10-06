@@ -7,12 +7,16 @@ use std::time::{Duration as StdDuration, Instant};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use chrono::{Duration, Utc};
-use keystone_core::{AccountFile, AccountGrant, AccountRecord, EntitlementSource};
+use keystone_core::{
+    AccountFile, AccountGrant, AccountRecord, AccountSummary, EntitlementSource, GrantSummary,
+};
 use keystone_server::accounts::LocalAccounts;
 
 const ACCOUNT: &str = "dev";
 const SECRET: &str = "devpass";
 const PRODUCT: &str = "dev-product";
+const MACHINE_A: [u8; 32] = [0xa1; 32];
+const MACHINE_B: [u8; 32] = [0xb2; 32];
 
 fn hash(secret: &str) -> String {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
@@ -28,6 +32,7 @@ fn record(name: &str, secret: &str, grants: Vec<AccountGrant>) -> AccountRecord 
         secret_hash: hash(secret),
         entitlements: grants,
         cert_sha256: None,
+        hwid_lock: None,
     }
 }
 
@@ -200,6 +205,102 @@ async fn cert_pin_is_decoded_and_validated() {
     assert!(backend.cert_sha256("broken").await.is_err());
 }
 
+#[tokio::test]
+async fn the_hwid_lock_binds_once_and_survives_a_reload() {
+    let dir = workdir();
+    let path = write(
+        &dir,
+        vec![record(ACCOUNT, SECRET, vec![grant(PRODUCT, 30, &["all"])])],
+    );
+    let backend = LocalAccounts::open(path.clone());
+    assert_eq!(
+        backend.account_summary(ACCOUNT).await.unwrap().unwrap(),
+        AccountSummary {
+            hwid_locked: false,
+            grants: vec![GrantSummary {
+                product: PRODUCT.to_string(),
+                expires_at: backend
+                    .entitlement(ACCOUNT, PRODUCT)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expires_at,
+            }],
+        }
+    );
+
+    // The first machine binds; every later one reads back that binding.
+    assert_eq!(
+        backend.bind_hwid(ACCOUNT, MACHINE_A).await.unwrap(),
+        Some(MACHINE_A)
+    );
+    assert_eq!(
+        backend.bind_hwid(ACCOUNT, MACHINE_B).await.unwrap(),
+        Some(MACHINE_A)
+    );
+    assert!(
+        backend
+            .account_summary(ACCOUNT)
+            .await
+            .unwrap()
+            .unwrap()
+            .hwid_locked
+    );
+
+    // A reload from the file keeps the lock: it was persisted, not cached.
+    let reloaded = LocalAccounts::open(path);
+    assert_eq!(
+        reloaded.bind_hwid(ACCOUNT, MACHINE_B).await.unwrap(),
+        Some(MACHINE_A)
+    );
+    assert!(
+        reloaded
+            .account_summary(ACCOUNT)
+            .await
+            .unwrap()
+            .unwrap()
+            .hwid_locked
+    );
+    assert!(
+        reloaded
+            .authenticate(ACCOUNT, SECRET)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn clearing_the_hwid_lock_persists_and_frees_the_next_machine() {
+    let dir = workdir();
+    let path = write(&dir, vec![record(ACCOUNT, SECRET, vec![])]);
+    let backend = LocalAccounts::open(path.clone());
+    backend.bind_hwid(ACCOUNT, MACHINE_A).await.unwrap();
+
+    assert_eq!(backend.clear_hwid_lock(ACCOUNT).await.unwrap(), Some(true));
+    assert_eq!(backend.clear_hwid_lock(ACCOUNT).await.unwrap(), Some(false));
+    assert_eq!(
+        backend.bind_hwid(ACCOUNT, MACHINE_B).await.unwrap(),
+        Some(MACHINE_B)
+    );
+
+    let reloaded = LocalAccounts::open(path);
+    assert_eq!(
+        reloaded.bind_hwid(ACCOUNT, MACHINE_A).await.unwrap(),
+        Some(MACHINE_B)
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_account_has_no_lock_to_bind_clear_or_report() {
+    let dir = workdir();
+    let path = write(&dir, vec![record(ACCOUNT, SECRET, vec![])]);
+    let backend = LocalAccounts::open(path);
+    assert_eq!(backend.bind_hwid("nobody", MACHINE_A).await.unwrap(), None);
+    assert_eq!(backend.clear_hwid_lock("nobody").await.unwrap(), None);
+    assert!(backend.account_summary("nobody").await.unwrap().is_none());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn password_hashing_does_not_block_the_executor() {
     let dir = workdir();
@@ -211,6 +312,7 @@ async fn password_hashing_does_not_block_the_executor() {
             secret_hash: stored.clone(),
             entitlements: vec![],
             cert_sha256: None,
+            hwid_lock: None,
         }],
     }
     .save(&path)

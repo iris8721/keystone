@@ -1021,6 +1021,7 @@ fn cmd_dev() -> Result<()> {
             secret_hash: hash_secret(DEV_SECRET)?,
             entitlements: vec![],
             cert_sha256: None,
+            hwid_lock: None,
         });
     }
     let record = file
@@ -1392,6 +1393,7 @@ fn account_add(args: &[String]) -> Result<()> {
         secret_hash: hash_secret(&secret)?,
         entitlements: vec![],
         cert_sha256: None,
+        hwid_lock: None,
     });
     file.save(&path)?;
     println!("added account {name} to {}", path.display());
