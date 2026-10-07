@@ -18,14 +18,14 @@ use chrono::{DateTime, Duration, Utc};
 use http_body_util::BodyExt;
 use keystone_core::wire::{
     self, AUDIENCE_APP, AUDIENCE_CLIENT, AttestBody, AttestRequest, ErrorBody, ErrorCode,
-    ExchangeBody, ExchangeRequest, HandoffBody, HandoffRequest, HeartbeatRequest, LeaseBody,
-    OP_ATTEST, OP_EXCHANGE, OP_HANDOFF, OP_HEARTBEAT, PROTOCOL_HEADER, PayloadBody, PayloadRequest,
-    mac_context,
+    ExchangeBody, ExchangeRequest, HandoffBody, HandoffRequest, HeartbeatRequest, HwidComponent,
+    HwidProbe, LeaseBody, OP_ATTEST, OP_EXCHANGE, OP_HANDOFF, OP_HEARTBEAT, PROTOCOL_HEADER,
+    PayloadBody, PayloadRequest, mac_context, match_hwid_probe,
 };
 use keystone_core::{
     AccountIdentity, AccountSummary, BackendError, Challenge, Entitlement, EntitlementSource,
-    Envelope, Expectation, GrantSummary, Issuer, RequestBinding, TrustedIssuers, handoff_wrap_key,
-    mac_request, unwrap_secret,
+    Envelope, Expectation, GrantSummary, HwidVerdict, Issuer, RequestBinding, TrustedIssuers,
+    handoff_wrap_key, mac_request, unwrap_secret,
 };
 use keystone_server::{
     AppState, AppStateBuilder, AuditEvent, AuditSink, HandoffRecord, Listeners, MemoryStore,
@@ -61,6 +61,7 @@ struct Account {
     grants: Vec<Entitlement>,
     pin: Option<[u8; 32]>,
     hwid_lock: Option<[u8; 32]>,
+    hwid_components: Option<Vec<HwidComponent>>,
 }
 
 /// Plain-comparison entitlement source whose grants and pins tests can
@@ -94,6 +95,7 @@ impl TestSource {
                 grants,
                 pin: None,
                 hwid_lock: None,
+                hwid_components: None,
             },
         );
     }
@@ -120,6 +122,14 @@ impl TestSource {
     /// Bind or clear the lock out of band.
     pub fn set_hwid_lock(&self, account: &str, lock: Option<[u8; 32]>) {
         self.accounts.write().get_mut(account).unwrap().hwid_lock = lock;
+    }
+
+    /// The component set the account is bound to, if any.
+    pub fn hwid_components(&self, account: &str) -> Option<Vec<HwidComponent>> {
+        self.accounts
+            .read()
+            .get(account)
+            .and_then(|a| a.hwid_components.clone())
     }
 
     pub fn set_down(&self, down: bool) {
@@ -187,9 +197,68 @@ impl EntitlementSource for TestSource {
             return Ok(None);
         }
         let mut accounts = self.accounts.write();
-        Ok(accounts
-            .get_mut(account)
-            .map(|a| *a.hwid_lock.get_or_insert(hwid_hash)))
+        Ok(accounts.get_mut(account).map(|a| {
+            if a.hwid_lock.is_none() && a.hwid_components.is_some() {
+                // Mirror LocalAccounts: a component-bound account rejects
+                // the legacy flavor with a lock guaranteed to differ.
+                let mut foreign = hwid_hash;
+                foreign[0] ^= 0xff;
+                foreign
+            } else {
+                *a.hwid_lock.get_or_insert(hwid_hash)
+            }
+        }))
+    }
+
+    async fn match_hwid(
+        &self,
+        account: &str,
+        probe: &HwidProbe,
+    ) -> Result<Option<HwidVerdict>, BackendError> {
+        self.check_up()?;
+        if !self.binds_machines.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let mut accounts = self.accounts.write();
+        let Some(account) = accounts.get_mut(account) else {
+            return Ok(Some(HwidVerdict::Unknown));
+        };
+        match &account.hwid_components {
+            None => {
+                if account.hwid_lock.is_some() {
+                    // Mirror LocalAccounts: a legacy-locked account
+                    // rejects component probes until an admin reset.
+                    return Ok(Some(HwidVerdict::Rejected));
+                }
+                account.hwid_components = Some(probe.components.clone());
+                Ok(Some(HwidVerdict::Accepted { updated: true }))
+            }
+            Some(stored) => Ok(Some(match match_hwid_probe(stored, &probe.components) {
+                wire::HwidMatch::Accepted { healed, .. } => {
+                    let updated = healed != *stored;
+                    if updated {
+                        account.hwid_components = Some(healed);
+                    }
+                    HwidVerdict::Accepted { updated }
+                }
+                wire::HwidMatch::Rejected { .. } => HwidVerdict::Rejected,
+            })),
+        }
+    }
+
+    async fn hwid_components(
+        &self,
+        account: &str,
+    ) -> Result<Option<Vec<HwidComponent>>, BackendError> {
+        self.check_up()?;
+        if !self.binds_machines.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(self
+            .accounts
+            .read()
+            .get(account)
+            .and_then(|a| a.hwid_components.clone()))
     }
 
     async fn clear_hwid_lock(&self, account: &str) -> Result<Option<bool>, BackendError> {
@@ -198,9 +267,11 @@ impl EntitlementSource for TestSource {
             return Ok(None);
         }
         let mut accounts = self.accounts.write();
-        Ok(accounts
-            .get_mut(account)
-            .map(|a| a.hwid_lock.take().is_some()))
+        Ok(accounts.get_mut(account).map(|a| {
+            let was_locked = a.hwid_lock.take().is_some();
+            let had_components = a.hwid_components.take().is_some();
+            was_locked || had_components
+        }))
     }
 
     async fn account_summary(&self, account: &str) -> Result<Option<AccountSummary>, BackendError> {
@@ -210,7 +281,7 @@ impl EntitlementSource for TestSource {
         }
         let accounts = self.accounts.read();
         Ok(accounts.get(account).map(|a| AccountSummary {
-            hwid_locked: a.hwid_lock.is_some(),
+            hwid_locked: a.hwid_lock.is_some() || a.hwid_components.is_some(),
             grants: a
                 .grants
                 .iter()
@@ -523,6 +594,7 @@ pub fn exchange_req(account: &str, secret: &str, product: &str) -> ExchangeReque
         secret: Zeroizing::new(secret.to_string()),
         product: product.to_string(),
         hwid: [3u8; 32],
+        components: None,
         challenge: nonce(),
     }
 }

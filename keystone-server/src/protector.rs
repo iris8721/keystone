@@ -17,7 +17,6 @@ use std::path::Path;
 use std::process::Stdio;
 
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
 use keystone_core::fs::write_owner_only_atomic;
 use keystone_core::{decrypt_artifact, seal_under};
 use parking_lot::Mutex;
@@ -109,21 +108,11 @@ impl MutationCache {
 /// Deterministic watermark bytes for one download: HMAC-SHA256 blocks
 /// keyed by the watermark secret over the download id, truncated to the
 /// pattern length. Given a suspect download's id, an operator recomputes
-/// these bytes and matches them against the patched region.
+/// these bytes and matches them against the patched region. Alias for
+/// [`keystone_core::watermark::tag_bytes`]; every patched site in a
+/// download holds this same tag.
 pub fn watermark_bytes(secret: &[u8; 32], download_id: &str, len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    let mut block = 0u8;
-    while out.len() < len {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&secret[..])
-            .expect("HMAC accepts any key length");
-        mac.update(b"keystone-watermark");
-        mac.update(&[block]);
-        mac.update(download_id.as_bytes());
-        out.extend_from_slice(&mac.finalize().into_bytes());
-        block += 1;
-    }
-    out.truncate(len);
-    out
+    keystone_core::watermark::tag_bytes(secret, download_id, len)
 }
 
 /// Decrypt the stored artifact, watermark it when the configured pattern
@@ -151,9 +140,11 @@ pub(crate) async fn mutate(
     })
 }
 
-/// Decrypt under the fetched key and patch the first pattern occurrence
-/// with bytes derived from the download id. A missing pattern skips the
-/// watermark (the protector still runs) and says so.
+/// Decrypt under the fetched key and patch a per-download subset of the
+/// pattern's occurrences with the download's tag. Zero occurrences skips
+/// the watermark (the protector still runs) and says so; exactly one is
+/// the legacy single-site patch; two or more selects up to
+/// `watermark_sites` offsets via [`keystone_core::watermark::apply`].
 async fn watermark(
     payloads: &PayloadConfig,
     protector: &ProtectorConfig,
@@ -166,17 +157,38 @@ async fn watermark(
     let watermark_secret = *payloads.watermark_secret;
     let download_id = download_id.to_string();
     let pattern = protector.watermark_pattern.clone();
+    let sites = protector.watermark_sites;
     let plaintext = tokio::task::spawn_blocking(move || {
+        use keystone_core::watermark::PatchOutcome;
         let mut plaintext = decrypt_artifact(&key, &sealed)
             .map_err(|_| "stored artifact does not open under its key")?;
-        if let Some(pattern) = &pattern
-            && let Some(at) = find_subslice(&plaintext, pattern)
-        {
-            let patch = watermark_bytes(&watermark_secret, &download_id, pattern.len());
-            plaintext[at..at + pattern.len()].copy_from_slice(&patch);
-            return Ok::<_, &'static str>((plaintext, true));
+        let Some(pattern) = &pattern else {
+            return Ok::<_, &'static str>((plaintext, false));
+        };
+        match keystone_core::watermark::apply(
+            &mut plaintext,
+            pattern,
+            &watermark_secret,
+            &download_id,
+            sites,
+        ) {
+            PatchOutcome::NotFound => Ok((plaintext, false)),
+            PatchOutcome::SingleSite => {
+                tracing::debug!("one watermark pattern occurrence; legacy single-site patch");
+                Ok((plaintext, true))
+            }
+            PatchOutcome::MultiSite {
+                patched,
+                candidates,
+            } => {
+                tracing::debug!(
+                    patched,
+                    candidates,
+                    "watermarked a per-download subset of pattern sites"
+                );
+                Ok((plaintext, true))
+            }
         }
-        Ok((plaintext, false))
     })
     .await
     .map_err(|e| artifact_invalid(format!("watermark task: {e}")))?
@@ -185,10 +197,6 @@ async fn watermark(
         tracing::info!("watermark pattern not found; artifact served unwatermarked");
     }
     Ok(plaintext)
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Run the protector over `plaintext` in a private temp directory that is

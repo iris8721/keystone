@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::BackendError;
+use crate::wire::{HwidComponent, HwidProbe};
 
 /// A product grant attached to an account. Expiry is absolute — an
 /// expired entitlement authorizes nothing even if the credentials that
@@ -72,6 +73,36 @@ pub trait EntitlementSource: Send + Sync {
         Ok(None)
     }
 
+    /// Match a component fingerprint probe against the account's bound
+    /// component set, binding the set on the first probe. `None` (the
+    /// default) means this backend does not bind machines by component
+    /// set. [`HwidVerdict::Accepted`] means the probe is the bound
+    /// machine, possibly after the stored set self-healed to the probe's
+    /// hashes for kinds whose hash changed; `updated` reports whether the
+    /// stored set changed. [`HwidVerdict::Rejected`] means a different
+    /// machine; [`HwidVerdict::Unknown`] that the account does not exist.
+    /// The check-and-update must be atomic, so concurrent first probes
+    /// cannot bind two machines and an accepted probe never loses its
+    /// self-heal to a racing one.
+    async fn match_hwid(
+        &self,
+        _account: &str,
+        _probe: &HwidProbe,
+    ) -> Result<Option<HwidVerdict>, BackendError> {
+        Ok(None)
+    }
+
+    /// The account's bound component set, if any; `None` when this backend
+    /// does not bind machines by component set (the default), the account
+    /// is unknown, or no set is bound. Powers the fuzzy-reject audit
+    /// trail, which re-scores the refused probe against it.
+    async fn hwid_components(
+        &self,
+        _account: &str,
+    ) -> Result<Option<Vec<HwidComponent>>, BackendError> {
+        Ok(None)
+    }
+
     /// Clear the account's machine lock. `None` for an unknown account,
     /// otherwise whether a lock was held. Defaults to `None` (backend does
     /// not bind machines).
@@ -88,6 +119,22 @@ pub trait EntitlementSource: Send + Sync {
     }
 }
 
+/// How a component fingerprint probe compared to the account's bound
+/// component set; see [`EntitlementSource::match_hwid`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwidVerdict {
+    /// The probe is the bound machine. `updated` reports whether the
+    /// stored component set changed on the way (self-healing).
+    Accepted {
+        /// Whether the stored component set changed.
+        updated: bool,
+    },
+    /// The probe is a different machine; the caller refuses the session.
+    Rejected,
+    /// The account does not exist.
+    Unknown,
+}
+
 /// One grant as the operator account view reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantSummary {
@@ -100,7 +147,8 @@ pub struct GrantSummary {
 /// What an operator may see of an account: no credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSummary {
-    /// Whether the account is bound to a machine fingerprint.
+    /// Whether the account is bound to a machine fingerprint: a legacy
+    /// single-hash lock or a stored component set.
     pub hwid_locked: bool,
     /// Every grant, expired or not.
     pub grants: Vec<GrantSummary>,

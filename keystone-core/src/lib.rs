@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod payload;
 pub mod replay;
 pub mod revocations;
+pub mod watermark;
 pub mod wire;
 
 /// Ed25519 public key type used by [`TrustedIssuers`] and [`Issuer::verifying_key`].
@@ -32,7 +33,7 @@ pub use crypto::{
     derive_watermark_secret, mac_request, request_nonce_expiry, verify_request_mac,
 };
 pub use entitlement::{
-    AccountIdentity, AccountSummary, Entitlement, EntitlementSource, GrantSummary,
+    AccountIdentity, AccountSummary, Entitlement, EntitlementSource, GrantSummary, HwidVerdict,
 };
 pub use envelope::{BootstrapExpectation, Envelope, Expectation, IssueSpec};
 pub use error::{BackendError, KeystoneError, Result};
@@ -46,3 +47,4 @@ pub use payload::{
     unwrap_artifact_key, unwrap_secret, valid_segment, wrap_secret,
 };
 pub use replay::ConsumedSet;
+pub use wire::{HwidComponent, HwidComponentKind, HwidProbe};

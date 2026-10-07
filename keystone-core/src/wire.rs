@@ -324,6 +324,262 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+/// Most HWID components one probe may carry. The kind set is closed, so
+/// this bound only rejects padded garbage.
+pub const MAX_HWID_COMPONENTS: usize = 16;
+
+/// Weight of [`HwidComponentKind::SmbiosUuid`] in [`hwid_match_score`]:
+/// dies with the motherboard, so it dominates the score.
+pub const HWID_WEIGHT_SMBIOS_UUID: u32 = 4;
+/// Weight of [`HwidComponentKind::BoardSerial`] in [`hwid_match_score`]:
+/// dies with the motherboard, so it dominates the score.
+pub const HWID_WEIGHT_BOARD_SERIAL: u32 = 4;
+/// Weight of [`HwidComponentKind::DiskSerial`] in [`hwid_match_score`]:
+/// survives reinstalls but is common consumer maintenance.
+pub const HWID_WEIGHT_DISK_SERIAL: u32 = 2;
+/// Weight of [`HwidComponentKind::MachineGuid`] in [`hwid_match_score`]:
+/// per Windows install, so a reinstall must not cost a reset by itself.
+pub const HWID_WEIGHT_MACHINE_GUID: u32 = 2;
+/// Weight of [`HwidComponentKind::MacAddress`] in [`hwid_match_score`]:
+/// unstable (NIC swaps, docks, VPN adapters), a corroborator only.
+pub const HWID_WEIGHT_MAC_ADDRESS: u32 = 1;
+/// Weight of [`HwidComponentKind::CpuName`] in [`hwid_match_score`]:
+/// extremely stable but non-unique across identical SKUs.
+pub const HWID_WEIGHT_CPU_NAME: u32 = 1;
+
+/// Lowest [`hwid_match_score`] still accepted as the same machine. On a
+/// full six-component probe (total weight 14) any single change to a
+/// 4-weight chassis kind (SMBIOS UUID or board serial) scores 10/14 ≈
+/// 0.714 and is rejected, any single change to a ≤2-weight kind scores
+/// ≥12/14 ≈ 0.857 and is accepted, and two light changes score 11/14 ≈
+/// 0.786 and are accepted. Rejecting single chassis changes is what kills
+/// the two-step chassis walk (change board → heal, change smbios → heal):
+/// the heal only runs on acceptance, so the first step never lands. It is
+/// a build-time constant rather than a wire field, so it can be tuned
+/// without a protocol change.
+pub const HWID_MATCH_THRESHOLD: f64 = 0.75;
+
+/// One hashed hardware identifier: which value, and its HMAC.
+///
+/// The client hashes each raw value itself with
+/// `HMAC(product_public_salt, value)`; the server only ever sees the
+/// hashes, never raw serials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HwidComponent {
+    /// Which identifier the hash came from.
+    pub kind: HwidComponentKind,
+    /// HMAC of the raw component value under the product's public salt.
+    pub hash: [u8; 32],
+}
+
+/// The hardware identifiers a probe may carry. Weights follow the
+/// industry's fuzzy-matching practice (motherboard-dominated scoring):
+/// SMBIOS UUID and board serial high, disk serial and MachineGuid medium,
+/// MAC and CPU name low.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HwidComponentKind {
+    /// SMBIOS UUID (WMI `Win32_ComputerSystemProduct.UUID`); dies with the
+    /// motherboard.
+    SmbiosUuid,
+    /// Motherboard serial (WMI `Win32_BaseBoard.SerialNumber`); dies with
+    /// the motherboard.
+    BoardSerial,
+    /// System disk firmware serial (WMI `Win32_DiskDrive.SerialNumber`).
+    DiskSerial,
+    /// `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`; per Windows
+    /// install, regenerated on reinstall.
+    MachineGuid,
+    /// Primary NIC MAC address; a low-weight corroborator only.
+    MacAddress,
+    /// Processor name string; stable but not unique.
+    CpuName,
+}
+
+impl HwidComponentKind {
+    /// Weight of this kind in [`hwid_match_score`].
+    pub fn weight(self) -> u32 {
+        match self {
+            HwidComponentKind::SmbiosUuid => HWID_WEIGHT_SMBIOS_UUID,
+            HwidComponentKind::BoardSerial => HWID_WEIGHT_BOARD_SERIAL,
+            HwidComponentKind::DiskSerial => HWID_WEIGHT_DISK_SERIAL,
+            HwidComponentKind::MachineGuid => HWID_WEIGHT_MACHINE_GUID,
+            HwidComponentKind::MacAddress => HWID_WEIGHT_MAC_ADDRESS,
+            HwidComponentKind::CpuName => HWID_WEIGHT_CPU_NAME,
+        }
+    }
+
+    /// The snake_case wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HwidComponentKind::SmbiosUuid => "smbios_uuid",
+            HwidComponentKind::BoardSerial => "board_serial",
+            HwidComponentKind::DiskSerial => "disk_serial",
+            HwidComponentKind::MachineGuid => "machine_guid",
+            HwidComponentKind::MacAddress => "mac_address",
+            HwidComponentKind::CpuName => "cpu_name",
+        }
+    }
+}
+
+/// A machine fingerprint probe: the component set a client presents at
+/// exchange time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HwidProbe {
+    /// Hashed components, at least one, at most one per kind except
+    /// [`HwidComponentKind::MacAddress`]: a multi-NIC machine may carry
+    /// several MACs.
+    pub components: Vec<HwidComponent>,
+}
+
+impl HwidProbe {
+    /// Enforce the probe invariants; see [`validate_components`].
+    pub fn validate(&self) -> Result<()> {
+        validate_components(&self.components)
+    }
+}
+
+/// Enforce the component-set invariants: at least one component
+/// (`Malformed`), within [`MAX_HWID_COMPONENTS`] (`FieldTooLong`), and no
+/// kind twice (`Malformed`) except [`HwidComponentKind::MacAddress`],
+/// which may repeat for multi-NIC machines.
+fn validate_components(components: &[HwidComponent]) -> Result<()> {
+    if components.is_empty() {
+        return Err(KeystoneError::Malformed("components is empty".into()));
+    }
+    if components.len() > MAX_HWID_COMPONENTS {
+        return Err(KeystoneError::FieldTooLong("components"));
+    }
+    for (seen, component) in components.iter().enumerate() {
+        if component.kind != HwidComponentKind::MacAddress
+            && components[..seen]
+                .iter()
+                .any(|prev| prev.kind == component.kind)
+        {
+            return Err(KeystoneError::Malformed(format!(
+                "duplicate {} component",
+                component.kind.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Weighted agreement of `probe` with `stored`: the summed
+/// [`HwidComponentKind::weight`] of components whose kind appears in both
+/// sets with an equal hash, over the summed weight of every kind present
+/// in both. Kinds only one side carries neither help nor hurt. `0.0` when
+/// the sets share no kind at all. MAC addresses score as ONE kind with
+/// weight 1 counted once no matter how many NICs each side carries: the
+/// kind matches when any probe MAC equals any stored MAC.
+pub fn hwid_match_score(stored: &[HwidComponent], probe: &[HwidComponent]) -> f64 {
+    let mut matched = 0u32;
+    let mut total = 0u32;
+    let mut macs_scored = false;
+    for stored_component in stored {
+        let kind = stored_component.kind;
+        if !probe.iter().any(|c| c.kind == kind) {
+            continue;
+        }
+        if kind == HwidComponentKind::MacAddress {
+            if macs_scored {
+                continue;
+            }
+            macs_scored = true;
+            total += kind.weight();
+            let any_match = stored
+                .iter()
+                .filter(|s| s.kind == kind)
+                .any(|s| probe.iter().any(|p| p.kind == kind && p.hash == s.hash));
+            if any_match {
+                matched += kind.weight();
+            }
+            continue;
+        }
+        let Some(probe_component) = probe.iter().find(|c| c.kind == kind) else {
+            continue;
+        };
+        total += kind.weight();
+        if probe_component.hash == stored_component.hash {
+            matched += kind.weight();
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        f64::from(matched) / f64::from(total)
+    }
+}
+
+/// How a probe compared to a bound component set; see [`match_hwid_probe`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HwidMatch {
+    /// Same machine: the score reached [`HWID_MATCH_THRESHOLD`]. `healed`
+    /// is the stored set with the probe's hashes adopted for kinds whose
+    /// hash changed, so component upgrades stop costing resets; kinds only
+    /// one side carries are left alone. The MAC set heals wholesale: on
+    /// accept the stored MACs are replaced by the probe's MAC set (or kept
+    /// when the probe carries none).
+    Accepted {
+        /// The weighted agreement score.
+        score: f64,
+        /// The self-healed stored set.
+        healed: Vec<HwidComponent>,
+    },
+    /// A different machine.
+    Rejected {
+        /// The weighted agreement score.
+        score: f64,
+    },
+}
+
+/// Score `probe` against the bound `stored` set (see [`hwid_match_score`])
+/// and classify it against [`HWID_MATCH_THRESHOLD`]. Pure: the atomicity
+/// of the check-and-update is the entitlement backend's job.
+pub fn match_hwid_probe(stored: &[HwidComponent], probe: &[HwidComponent]) -> HwidMatch {
+    let score = hwid_match_score(stored, probe);
+    if score < HWID_MATCH_THRESHOLD {
+        return HwidMatch::Rejected { score };
+    }
+    let mut healed = Vec::with_capacity(stored.len());
+    let mut macs_healed = false;
+    for s in stored {
+        if s.kind == HwidComponentKind::MacAddress {
+            if macs_healed {
+                continue;
+            }
+            macs_healed = true;
+            // Replace the stored MAC set with the probe's MAC set; a probe
+            // without MACs leaves the stored set alone.
+            let probe_macs = probe
+                .iter()
+                .filter(|c| c.kind == HwidComponentKind::MacAddress);
+            let mut carried = false;
+            for mac in probe_macs {
+                healed.push(*mac);
+                carried = true;
+            }
+            if !carried {
+                healed.extend(
+                    stored
+                        .iter()
+                        .filter(|c| c.kind == HwidComponentKind::MacAddress)
+                        .copied(),
+                );
+            }
+            continue;
+        }
+        healed.push(
+            probe
+                .iter()
+                .find(|c| c.kind == s.kind)
+                .copied()
+                .unwrap_or(*s),
+        );
+    }
+    HwidMatch::Accepted { score, healed }
+}
+
 /// `POST /exchange`: credentials for a new session.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ExchangeRequest {
@@ -335,16 +591,27 @@ pub struct ExchangeRequest {
     pub product: String,
     /// Hardware fingerprint; an anomaly signal, not a gate.
     pub hwid: [u8; 32],
+    /// Hashed component fingerprint. When present the server binds and
+    /// matches the account by weighted component score instead of the
+    /// strict `hwid` lock; legacy clients omit it and keep the strict
+    /// behaviour. `hwid` still rides along for anomaly telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<Vec<HwidComponent>>,
     /// Challenge nonce the exchange envelope must echo.
     pub challenge: [u8; 32],
 }
 
 impl ExchangeRequest {
-    /// Enforce the field caps; `product` must also be a valid path segment.
+    /// Enforce the field caps; `product` must also be a valid path segment,
+    /// and a carried component set must pass [`HwidProbe::validate`].
     pub fn validate(&self) -> Result<()> {
         required("account", &self.account, MAX_ACCOUNT_LEN)?;
         required("secret", &self.secret, MAX_SECRET_LEN)?;
-        segment("product", &self.product, MAX_PRODUCT_LEN)
+        segment("product", &self.product, MAX_PRODUCT_LEN)?;
+        if let Some(components) = &self.components {
+            validate_components(components)?;
+        }
+        Ok(())
     }
 }
 

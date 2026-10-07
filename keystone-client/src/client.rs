@@ -9,9 +9,9 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration, Utc};
 use keystone_core::wire::{
     AUDIENCE_APP, AUDIENCE_CLIENT, AttestBody, AttestRequest, DownloadAuthorization, ExchangeBody,
-    ExchangeRequest, HandoffBody, HandoffRequest, HeartbeatRequest, LeaseBody, MAX_HANDOFF_TTL,
-    OP_ATTEST, OP_EXCHANGE, OP_HANDOFF, OP_HEARTBEAT, OP_PAYLOAD_FETCH, PayloadBody,
-    PayloadRequest, Verdict, mac_context, paths, validate_release,
+    ExchangeRequest, HandoffBody, HandoffRequest, HeartbeatRequest, HwidComponent, LeaseBody,
+    MAX_HANDOFF_TTL, OP_ATTEST, OP_EXCHANGE, OP_HANDOFF, OP_HEARTBEAT, OP_PAYLOAD_FETCH,
+    PayloadBody, PayloadRequest, Verdict, mac_context, paths, validate_release,
 };
 use keystone_core::{
     BootstrapExpectation, Challenge, DeadReason, Envelope, Expectation, HandoffPayload,
@@ -166,12 +166,44 @@ impl KeystoneClient {
         product: &str,
         hwid: [u8; 32],
     ) -> Result<ClientSession, ClientError> {
+        self.exchange_with(account, secret, product, hwid, None)
+            .await
+    }
+
+    /// Like [`Self::exchange`], but sends a component fingerprint the
+    /// server scores fuzzily instead of the strict `hwid` lock: the first
+    /// exchange binds the set, later exchanges accept weighted matches and
+    /// self-heal changed components. `components` are caller-provided and
+    /// already HMAC'd under the product's public salt — collecting them
+    /// from the OS is the loader's job, not this crate's. `hwid` still
+    /// rides along for anomaly telemetry.
+    pub async fn exchange_components(
+        &self,
+        account: &str,
+        secret: &str,
+        product: &str,
+        hwid: [u8; 32],
+        components: Vec<HwidComponent>,
+    ) -> Result<ClientSession, ClientError> {
+        self.exchange_with(account, secret, product, hwid, Some(components))
+            .await
+    }
+
+    async fn exchange_with(
+        &self,
+        account: &str,
+        secret: &str,
+        product: &str,
+        hwid: [u8; 32],
+        components: Option<Vec<HwidComponent>>,
+    ) -> Result<ClientSession, ClientError> {
         let challenge = Challenge::new();
         let request = ExchangeRequest {
             account: account.to_owned(),
             secret: Zeroizing::new(secret.to_owned()),
             product: product.to_owned(),
             hwid,
+            components,
             challenge: challenge.nonce,
         };
         request.validate()?;

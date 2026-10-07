@@ -2,8 +2,11 @@
 
 use axum::extract::State;
 use axum::response::Json;
-use keystone_core::wire::{AUDIENCE_CLIENT, ErrorCode, ExchangeBody, ExchangeRequest, OP_EXCHANGE};
-use keystone_core::{DeadReason, Envelope, Lease};
+use keystone_core::wire::{
+    AUDIENCE_CLIENT, ErrorCode, ExchangeBody, ExchangeRequest, HwidProbe, OP_EXCHANGE,
+    hwid_match_score,
+};
+use keystone_core::{DeadReason, Envelope, HwidVerdict, Lease};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -91,15 +94,53 @@ pub(crate) async fn exchange(
 
     let hwid_hash: [u8; 32] = Sha256::digest(req.hwid).into();
     // The machine lock binds on the first exchange and gates every later
-    // one; the session is never created when the machine differs.
-    let lock = state
-        .inner
-        .entitlements
-        .bind_hwid(&req.account, hwid_hash)
-        .await
-        .map_err(ApiError::backend)?;
-    if lock.is_some_and(|lock| lock != hwid_hash) {
-        return Err(denied(&state, &req.account, ErrorCode::HwidMismatch));
+    // one; the session is never created when the machine differs. A
+    // component-carrying request takes the fuzzy path: weighted scoring
+    // with self-healing, so upgrades stop burning resets. A legacy request
+    // keeps the strict single-hash path byte-for-byte.
+    match &req.components {
+        Some(components) => {
+            let probe = HwidProbe {
+                components: components.clone(),
+            };
+            let verdict = state
+                .inner
+                .entitlements
+                .match_hwid(&req.account, &probe)
+                .await
+                .map_err(ApiError::backend)?;
+            match verdict {
+                // The backend does not bind machines, or the account is
+                // unknown to it: nothing to enforce here.
+                None | Some(HwidVerdict::Unknown) | Some(HwidVerdict::Accepted { .. }) => {}
+                Some(HwidVerdict::Rejected) => {
+                    let stored = state
+                        .inner
+                        .entitlements
+                        .hwid_components(&req.account)
+                        .await
+                        .map_err(ApiError::backend)?;
+                    state.audit(AuditEvent::HwidFuzzyRejected {
+                        account: req.account.clone(),
+                        score: stored
+                            .as_deref()
+                            .map(|stored| hwid_match_score(stored, &probe.components)),
+                    });
+                    return Err(denied(&state, &req.account, ErrorCode::HwidMismatch));
+                }
+            }
+        }
+        None => {
+            let lock = state
+                .inner
+                .entitlements
+                .bind_hwid(&req.account, hwid_hash)
+                .await
+                .map_err(ApiError::backend)?;
+            if lock.is_some_and(|lock| lock != hwid_hash) {
+                return Err(denied(&state, &req.account, ErrorCode::HwidMismatch));
+            }
+        }
     }
     if state.hwid_anomaly(&req.account, hwid_hash, now) {
         state.audit(AuditEvent::HwidAnomaly {

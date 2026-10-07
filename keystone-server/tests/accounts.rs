@@ -33,6 +33,7 @@ fn record(name: &str, secret: &str, grants: Vec<AccountGrant>) -> AccountRecord 
         entitlements: grants,
         cert_sha256: None,
         hwid_lock: None,
+        hwid_components: None,
     }
 }
 
@@ -313,6 +314,7 @@ async fn password_hashing_does_not_block_the_executor() {
             entitlements: vec![],
             cert_sha256: None,
             hwid_lock: None,
+            hwid_components: None,
         }],
     }
     .save(&path)

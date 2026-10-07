@@ -104,6 +104,7 @@ async fn rig(plaintext: &[u8], watermark: bool, log: Option<PathBuf>) -> Rig {
         PayloadConfig::new(&dir, PAYLOAD_SECRET, EPOCH).with_protector(ProtectorConfig {
             script,
             watermark_pattern: watermark.then(|| PATTERN.to_vec()),
+            watermark_sites: keystone_core::watermark::DEFAULT_SITES,
         });
     let h = harness_with(TestSource::standard(), |b| {
         let b = b.payloads(payloads);
@@ -147,6 +148,53 @@ async fn download(h: &Harness, session: &Session) -> (StatusCode, Vec<u8>) {
         Some(&download_auth(session, PRODUCT, VERSION)),
     )
     .await
+}
+
+/// Five pattern slots separated by filler; two fetches share the slots
+/// but not the subset.
+const PLAINTEXT_MULTI: &[u8] = b"app WATERMARK_SLOT16 one WATERMARK_SLOT16 two WATERMARK_SLOT16 three WATERMARK_SLOT16 four WATERMARK_SLOT16 tail";
+
+#[tokio::test]
+async fn multi_site_plaintext_patches_a_per_download_subset() {
+    use keystone_core::watermark::{self, SiteState};
+    let Rig { h, .. } = rig(PLAINTEXT_MULTI, true, None).await;
+    let secret = derive_watermark_secret(&PAYLOAD_SECRET);
+    let session = exchange(&h).await;
+    let (manifest, key) = fetch(&h, &session).await;
+    let (status, sealed) = download(&h, &session).await;
+    assert_eq!(status, StatusCode::OK);
+    let plaintext = decrypt_artifact(&key, &sealed).unwrap();
+    manifest.verify_payload(&plaintext).unwrap();
+
+    // Every chosen slot holds the one tag; every skipped slot keeps the
+    // pattern; the verifier grades the served copy 4/4.
+    let candidates = watermark::candidate_sites(PLAINTEXT_MULTI, PATTERN);
+    assert_eq!(candidates.len(), 5);
+    let chosen = watermark::select_sites(&secret, &manifest.download_id, &candidates, 4);
+    assert_eq!(chosen.len(), 4);
+    let tag = watermark_bytes(&secret, &manifest.download_id, PATTERN.len());
+    for &at in &candidates {
+        let window = &plaintext[at..at + PATTERN.len()];
+        if chosen.contains(&at) {
+            assert_eq!(window, &tag[..], "chosen slot at {at}");
+        } else {
+            assert_eq!(window, PATTERN, "skipped slot at {at}");
+        }
+    }
+    let report = watermark::locate_watermarks(
+        PLAINTEXT_MULTI,
+        &plaintext,
+        PATTERN,
+        &manifest.download_id,
+        &secret,
+        4,
+    );
+    assert_eq!(watermark::match_confidence(&report), (4, 4));
+    assert!(
+        report
+            .iter()
+            .all(|m| m.state == SiteState::Intact || m.state == SiteState::Skipped)
+    );
 }
 
 #[tokio::test]

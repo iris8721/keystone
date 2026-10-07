@@ -24,7 +24,10 @@ pub use error::ClientError;
 pub use session::{ClientSession, PendingSession, SessionGate};
 pub use transport::ClientIdentity;
 
-pub use keystone_core::wire::{DEFAULT_HANDOFF_TTL, ErrorCode, PublishBody, RevokeBody, Verdict};
+pub use keystone_core::wire::{
+    DEFAULT_HANDOFF_TTL, ErrorCode, HwidComponent, HwidComponentKind, PublishBody, RevokeBody,
+    Verdict,
+};
 pub use keystone_core::{
     BackendError, DeadReason, FeatureGrant, HandoffToken, KeystoneError, Manifest, SignedManifest,
     TrustedIssuers, VerifyingKey,

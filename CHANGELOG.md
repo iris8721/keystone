@@ -8,6 +8,13 @@
 - `AdminClient::{hwid_reset, account_info}`.
 - `EntitlementSource::{bind_hwid, clear_hwid_lock, account_summary}` with defaults that do not bind, so existing backends keep their behaviour; `AccountSummary`, `GrantSummary`.
 
+### Added (fuzzy matching + watermarks)
+- Component-based machine matching: `ExchangeRequest.components` (`HwidProbe`/`HwidComponent`/`HwidComponentKind`) carries salted per-component hashes; scoring weights chassis kinds (SMBIOS UUID, board serial) at 4, disk/MachineGuid at 2, MAC/CPU at 1, accepting at 0.75 so any single chassis change is rejected while upgrades self-heal. `EntitlementSource::match_hwid` returns `HwidVerdict::{Accepted{updated}, Rejected, Unknown}`; `MacAddress` may repeat and matches on any overlap. Legacy single-hash requests and component probes enforce each other's locks — switching protocol flavor cannot rebind an account.
+- Multi-site watermarks: per-download mutation now patches up to 8 candidate pattern sites (subset derived from the watermark secret and download id, `KEYSTONE_PROTECTOR_WATERMARK_SITES`, default 4) with the same redundant tag, so partial stripping still identifies the copy. `keystone-core/src/watermark.rs` centralizes tag derivation; `xtask watermark-check` grades a suspect binary's sites as Intact/Stripped/Unpatched against a pristine reference.
+
+### Fixed
+- `xtask watermark-check` consumed flag values as positional arguments, misattributing leaks; positional parsing now skips flag-consumed tokens.
+
 ## 0.2.0
 
 Wire protocol 2. Not compatible with 0.1 clients, servers, key files or artifact layouts.

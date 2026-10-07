@@ -809,6 +809,7 @@ fn request_validation_enforces_caps() {
         secret: Zeroizing::new("s3cret".into()),
         product: product.into(),
         hwid: [0; 32],
+        components: None,
         challenge: [0; 32],
     };
     exchange(&"a".repeat(wire::MAX_ACCOUNT_LEN), "prod")
@@ -1219,6 +1220,7 @@ fn debug_impls_do_not_leak_secrets() {
         secret: Zeroizing::new("hunter2-password".into()),
         product: "prod".into(),
         hwid: [0; 32],
+        components: None,
         challenge: [0; 32],
     };
     assert!(!format!("{exchange:?}").contains("hunter2-password"));
@@ -1247,6 +1249,7 @@ fn account_file_save_roundtrips() {
             }],
             cert_sha256: None,
             hwid_lock: None,
+            hwid_components: None,
         }],
     };
     file.save(&path).expect("save");
@@ -1286,6 +1289,7 @@ fn account_hwid_lock_roundtrips_and_defaults_to_unlocked() {
             entitlements: vec![],
             cert_sha256: None,
             hwid_lock: Some([0x5a; 32]),
+            hwid_components: None,
         }],
     };
     file.save(&path).expect("save");
@@ -1300,9 +1304,14 @@ fn account_hwid_lock_roundtrips_and_defaults_to_unlocked() {
         "entitlements":[]}]}"#;
     let parsed: AccountFile = serde_json::from_str(legacy).unwrap();
     assert_eq!(parsed.accounts[0].hwid_lock, None);
+    assert_eq!(parsed.accounts[0].hwid_components, None);
     // An unlocked account writes no key at all.
     let json = serde_json::to_value(&parsed).unwrap();
     assert!(json["accounts"][0].get("hwid_lock").is_none(), "{json}");
+    assert!(
+        json["accounts"][0].get("hwid_components").is_none(),
+        "{json}"
+    );
 }
 
 #[test]
@@ -1382,6 +1391,7 @@ fn account_debug_redacts_secret_hash() {
             entitlements: vec![],
             cert_sha256: None,
             hwid_lock: None,
+            hwid_components: None,
         }],
     };
     let out = format!("{file:?}");

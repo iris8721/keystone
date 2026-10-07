@@ -755,6 +755,125 @@ impl Checklist {
     }
 }
 
+/// `watermark-check <suspect> <download-id> --reference <pristine>`:
+/// grade a suspect plaintext against the watermark the download should
+/// carry. Candidate slots come from the pristine reference (a suspect
+/// alone cannot distinguish "fully stripped" from "never watermarked");
+/// the subset and tag recompute from (watermark secret, download id).
+/// The pattern comes from `--pattern` or
+/// KEYSTONE_PROTECTOR_WATERMARK_PATTERN, the site count from `--sites`
+/// or KEYSTONE_PROTECTOR_WATERMARK_SITES (default 4), and the watermark
+/// secret from `--watermark-secret` or KEYSTONE_WATERMARK_SECRET, else
+/// derived from the payload secret file.
+fn cmd_watermark_check(args: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: cargo xtask watermark-check <suspect> <download-id> \
+        --reference <pristine> [--pattern <hex>] [--sites <n>] [--watermark-secret <hex>]";
+    let suspect_path = positional(args, USAGE)?;
+    // The download id is the first bare token after the suspect; tokens a
+    // `--flag value` pair consumes (e.g. `--reference pristine`) are not
+    // positionals.
+    let mut download_id = None;
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg.starts_with("--") {
+            rest.next();
+        } else {
+            download_id = Some(arg.clone());
+            break;
+        }
+    }
+    let download_id = download_id.context(USAGE)?;
+    let reference_path = take_value(args, "--reference")?.context(USAGE)?;
+    let pattern_hex = take_value(args, "--pattern")?
+        .or_else(|| std::env::var("KEYSTONE_PROTECTOR_WATERMARK_PATTERN").ok())
+        .context("pass --pattern <hex> or set KEYSTONE_PROTECTOR_WATERMARK_PATTERN")?;
+    let pattern = hex::decode(pattern_hex.trim()).context("pattern must be hexadecimal")?;
+    ensure!(!pattern.is_empty(), "pattern must not be empty");
+    let sites_raw = take_value(args, "--sites")?
+        .or_else(|| std::env::var("KEYSTONE_PROTECTOR_WATERMARK_SITES").ok());
+    let sites = match sites_raw {
+        Some(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("--sites must be an integer, got {raw:?}"))?,
+        None => keystone_core::watermark::DEFAULT_SITES,
+    }
+    .clamp(1, keystone_core::watermark::MAX_SITES);
+    let secret = match take_value(args, "--watermark-secret")?
+        .or_else(|| std::env::var("KEYSTONE_WATERMARK_SECRET").ok())
+    {
+        Some(hex_secret) => {
+            let bytes = Zeroizing::new(
+                hex::decode(hex_secret.trim())
+                    .context("watermark secret must be 64 hex characters")?,
+            );
+            let secret: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .context("watermark secret must be 64 hex characters")?;
+            Zeroizing::new(secret)
+        }
+        None => {
+            let path = std::env::var_os("KEYSTONE_PAYLOAD_SECRET_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let ws = Workspace::load().expect("xtask.toml loads when no secret is set");
+                    ws.path(&ws.cfg.paths.payload_secret)
+                });
+            let payload_secret = read_payload_secret(&path)?;
+            keystone_core::derive_watermark_secret(&payload_secret)
+        }
+    };
+
+    let suspect = read_plaintext(Path::new(&suspect_path))?;
+    let reference = read_plaintext(Path::new(&reference_path))?;
+    let report = keystone_core::watermark::locate_watermarks(
+        &reference,
+        &suspect,
+        &pattern,
+        &download_id,
+        &secret,
+        sites,
+    );
+    if report.is_empty() {
+        println!("no watermark pattern occurrence in the reference; nothing to check");
+        return Ok(());
+    }
+    println!(
+        "download {download_id}: {} candidate slot(s), expecting the tag at {}",
+        report.len(),
+        keystone_core::watermark::match_confidence(&report).1,
+    );
+    for m in &report {
+        let label = match m.state {
+            keystone_core::watermark::SiteState::Intact => "intact  ",
+            keystone_core::watermark::SiteState::Stripped => "STRIPPED",
+            keystone_core::watermark::SiteState::Unpatched => {
+                "UNPATCHED (chosen but the pattern survived; a served artifact never looks like this)"
+            }
+            keystone_core::watermark::SiteState::Skipped => {
+                "skipped (not chosen for this download)"
+            }
+        };
+        println!("  slot @ {:>8}: {label}", m.offset);
+    }
+    let (intact, chosen) = keystone_core::watermark::match_confidence(&report);
+    println!("match confidence: {intact}/{chosen} expected tag(s) intact");
+    if intact > 0 {
+        println!("verdict: consistent with download {download_id}");
+    } else if report
+        .iter()
+        .any(|m| m.state == keystone_core::watermark::SiteState::Stripped)
+    {
+        println!("verdict: every expected tag is stripped or corrupted");
+    } else {
+        println!(
+            "verdict: no tag found — fully stripped copies are indistinguishable from never-watermarked ones"
+        );
+    }
+    Ok(())
+}
+
 /// `verify`: preflight against the environment the server will read.
 /// Warnings are tolerated states; failures block a real run.
 fn cmd_verify() -> Result<()> {
@@ -1022,6 +1141,7 @@ fn cmd_dev() -> Result<()> {
             entitlements: vec![],
             cert_sha256: None,
             hwid_lock: None,
+            hwid_components: None,
         });
     }
     let record = file
@@ -1394,6 +1514,7 @@ fn account_add(args: &[String]) -> Result<()> {
         entitlements: vec![],
         cert_sha256: None,
         hwid_lock: None,
+        hwid_components: None,
     });
     file.save(&path)?;
     println!("added account {name} to {}", path.display());
@@ -1555,6 +1676,11 @@ fn usage() -> ! {
         mint the 32-byte artifact sealing secret
   seal --product <p> --version <v> --in <file> [--out <dir>] [--build-id <id>]
         seal into <dir>/<p>/<v>.bin with .sha256 and .build sidecars
+  watermark-check <suspect> <download-id> --reference <pristine>
+        grade a suspect plaintext against the download's expected watermark;
+        [--pattern <hex>] [--sites <n>] [--watermark-secret <hex>] fall back to
+        KEYSTONE_PROTECTOR_WATERMARK_PATTERN / _SITES / KEYSTONE_WATERMARK_SECRET,
+        then to the watermark secret derived from the payload secret
   verify
         preflight checklist against the server environment
   dev
@@ -1638,6 +1764,7 @@ fn main() -> Result<()> {
             build_id: take_value(rest, "--build-id")?,
         }),
         "verify" => cmd_verify(),
+        "watermark-check" => cmd_watermark_check(rest),
         "dev" => cmd_dev(),
         "deploy" => cmd_deploy(),
         "account" => cmd_account(rest),

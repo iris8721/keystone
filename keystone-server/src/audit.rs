@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 /// One security-relevant event. Carries no secrets; session ids are raw so
 /// a sink can correlate, and [`TracingAudit`] hashes them before logging.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Not `Eq`: [`AuditEvent::HwidFuzzyRejected`] carries a float score.
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AuditEvent {
     /// A session was created by `/exchange`.
@@ -29,6 +30,16 @@ pub enum AuditEvent {
     HwidAnomaly {
         /// The account.
         account: String,
+    },
+    /// A component fingerprint probe scored below the acceptance threshold
+    /// and the exchange was refused as `hwid_mismatch`. `score` is the
+    /// weighted agreement with the stored set; `None` when the backend
+    /// does not expose one.
+    HwidFuzzyRejected {
+        /// The account.
+        account: String,
+        /// Weighted agreement score in `[0, 1]`, when known.
+        score: Option<f64>,
     },
     /// An operator cleared an account's machine binding.
     HwidReset {
@@ -122,6 +133,17 @@ impl AuditSink for TracingAudit {
                 account = %sanitize(&account),
                 "hwid anomaly: new fingerprint within window"
             ),
+            AuditEvent::HwidFuzzyRejected { account, score } => {
+                let score = score
+                    .map(|s| format!("{s:.3}"))
+                    .unwrap_or_else(|| "?".into());
+                tracing::warn!(
+                    target: "keystone::audit",
+                    account = %sanitize(&account),
+                    score = %score,
+                    "hwid fuzzy reject: probe below acceptance threshold"
+                );
+            }
             AuditEvent::HwidReset { account } => tracing::info!(
                 target: "keystone::audit",
                 account = %sanitize(&account),

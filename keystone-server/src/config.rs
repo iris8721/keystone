@@ -129,9 +129,14 @@ impl fmt::Debug for AdminToken {
 pub struct ProtectorConfig {
     /// Protector script path; must exist at configuration time.
     pub script: PathBuf,
-    /// Hex pattern locating the reserved watermark region in the plaintext;
-    /// `None` disables watermarking.
+    /// Hex pattern locating the reserved watermark slots in the plaintext;
+    /// `None` disables watermarking. Its length is the slot size.
     pub watermark_pattern: Option<Vec<u8>>,
+    /// Slots patched per download when the pattern occurs at least twice
+    /// (`KEYSTONE_PROTECTOR_WATERMARK_SITES`; default
+    /// [`keystone_core::watermark::DEFAULT_SITES`], clamped
+    /// 1..=[`keystone_core::watermark::MAX_SITES`]).
+    pub watermark_sites: usize,
 }
 
 /// Where sealed releases live and the secrets that key them. Artifacts are
@@ -537,6 +542,7 @@ impl Env<'_> {
                     "KEYSTONE_PAYLOAD_EPOCH",
                     "KEYSTONE_WATERMARK_SECRET",
                     "KEYSTONE_PROTECTOR_SCRIPT",
+                    "KEYSTONE_PROTECTOR_WATERMARK_SITES",
                 ] {
                     if (self.0)(var).is_some() {
                         return Err(ServerError::config(var, "requires KEYSTONE_PAYLOAD_DIR"));
@@ -584,17 +590,21 @@ impl Env<'_> {
     }
 
     /// `KEYSTONE_PROTECTOR_SCRIPT` plus optional
-    /// `KEYSTONE_PROTECTOR_WATERMARK_PATTERN` (hex). The script must exist;
-    /// the pattern requires the script.
+    /// `KEYSTONE_PROTECTOR_WATERMARK_PATTERN` (hex) and
+    /// `KEYSTONE_PROTECTOR_WATERMARK_SITES` (1..=8, default 4). The script
+    /// must exist; the pattern and site count require the script.
     fn protector(&self) -> Result<Option<ProtectorConfig>, ServerError> {
         const SCRIPT: &str = "KEYSTONE_PROTECTOR_SCRIPT";
         const PATTERN: &str = "KEYSTONE_PROTECTOR_WATERMARK_PATTERN";
+        const SITES: &str = "KEYSTONE_PROTECTOR_WATERMARK_SITES";
         let Some(script) = self.path(SCRIPT) else {
-            if (self.0)(PATTERN).is_some() {
-                return Err(ServerError::config(
-                    PATTERN,
-                    "requires KEYSTONE_PROTECTOR_SCRIPT",
-                ));
+            for var in [PATTERN, SITES] {
+                if (self.0)(var).is_some() {
+                    return Err(ServerError::config(
+                        var,
+                        "requires KEYSTONE_PROTECTOR_SCRIPT",
+                    ));
+                }
             }
             return Ok(None);
         };
@@ -615,9 +625,14 @@ impl Env<'_> {
             }
             None => None,
         };
+        let watermark_sites = self
+            .parse::<usize>(SITES)?
+            .unwrap_or(keystone_core::watermark::DEFAULT_SITES)
+            .clamp(1, keystone_core::watermark::MAX_SITES);
         Ok(Some(ProtectorConfig {
             script,
             watermark_pattern,
+            watermark_sites,
         }))
     }
 
@@ -798,12 +813,78 @@ mod tests {
         let protector = payloads.protector.expect("protector configured");
         assert_eq!(protector.script, script);
         assert_eq!(protector.watermark_pattern, Some(b"KEYSTONE".to_vec()));
+        assert_eq!(
+            protector.watermark_sites,
+            keystone_core::watermark::DEFAULT_SITES
+        );
 
         // A script alone works; no pattern means no watermarking.
         let cfg = config(&payload_vars(dir_s, secret_s, Some(script_s), None)).unwrap();
         assert_eq!(
             cfg.payloads.unwrap().protector.unwrap().watermark_pattern,
             None
+        );
+    }
+
+    #[test]
+    fn watermark_sites_parse_clamp_and_require_the_script() {
+        let dir = std::env::temp_dir().join(format!("keystone-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, [1u8; 32]).unwrap();
+        let script = dir.join("protect.ps1");
+        std::fs::write(&script, b"#").unwrap();
+        let (dir_s, secret_s, script_s) = (
+            dir.to_str().unwrap(),
+            secret.to_str().unwrap(),
+            script.to_str().unwrap(),
+        );
+        fn vars<'a>(
+            sites: &'a str,
+            dir_s: &'a str,
+            secret_s: &'a str,
+            script_s: &'a str,
+        ) -> Vec<(&'a str, &'a str)> {
+            vec![
+                ("KEYSTONE_ALLOW_INSECURE", "1"),
+                ("KEYSTONE_PAYLOAD_DIR", dir_s),
+                ("KEYSTONE_PAYLOAD_SECRET_FILE", secret_s),
+                ("KEYSTONE_PROTECTOR_SCRIPT", script_s),
+                ("KEYSTONE_PROTECTOR_WATERMARK_SITES", sites),
+            ]
+        }
+        let sites_of = |vars: &[(&str, &str)]| {
+            config(vars)
+                .unwrap()
+                .payloads
+                .unwrap()
+                .protector
+                .unwrap()
+                .watermark_sites
+        };
+        assert_eq!(sites_of(&vars("1", dir_s, secret_s, script_s)), 1);
+        assert_eq!(sites_of(&vars("6", dir_s, secret_s, script_s)), 6);
+        // Clamped into 1..=8.
+        assert_eq!(sites_of(&vars("0", dir_s, secret_s, script_s)), 1);
+        assert_eq!(
+            sites_of(&vars("99", dir_s, secret_s, script_s)),
+            keystone_core::watermark::MAX_SITES
+        );
+        // Unparsable names the variable.
+        assert_eq!(
+            config_var(config(&vars("many", dir_s, secret_s, script_s))),
+            "KEYSTONE_PROTECTOR_WATERMARK_SITES"
+        );
+        // Set without a script names itself.
+        let bare: Vec<(&str, &str)> = vec![
+            ("KEYSTONE_ALLOW_INSECURE", "1"),
+            ("KEYSTONE_PAYLOAD_DIR", dir_s),
+            ("KEYSTONE_PAYLOAD_SECRET_FILE", secret_s),
+            ("KEYSTONE_PROTECTOR_WATERMARK_SITES", "4"),
+        ];
+        assert_eq!(
+            config_var(config(&bare)),
+            "KEYSTONE_PROTECTOR_WATERMARK_SITES"
         );
     }
 

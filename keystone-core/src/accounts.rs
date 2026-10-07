@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::KeystoneError;
+use crate::wire::HwidComponent;
 
 /// The parsed contents of the accounts file.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -40,6 +41,12 @@ pub struct AccountRecord {
     /// the first exchange; `None` until then or after an admin reset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hwid_lock: Option<[u8; 32]>,
+    /// Component fingerprint set this account is bound to, set on the
+    /// first exchange that carries components; `None` until then or after
+    /// an admin reset. Component-capable clients match against this set
+    /// instead of `hwid_lock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwid_components: Option<Vec<HwidComponent>>,
 }
 
 /// A product grant as stored in the file; the account is the record
@@ -85,6 +92,7 @@ impl fmt::Debug for AccountRecord {
             .field("entitlements", &self.entitlements)
             .field("cert_sha256", &self.cert_sha256)
             .field("hwid_lock", &self.hwid_lock)
+            .field("hwid_components", &self.hwid_components)
             .finish_non_exhaustive()
     }
 }

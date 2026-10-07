@@ -16,9 +16,10 @@ use argon2::password_hash::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use keystone_core::wire::{HwidMatch, match_hwid_probe};
 use keystone_core::{
     AccountFile, AccountIdentity, AccountSummary, BackendError, Entitlement, EntitlementSource,
-    GrantSummary,
+    GrantSummary, HwidProbe, HwidVerdict,
 };
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
@@ -293,17 +294,78 @@ impl EntitlementSource for LocalAccounts {
         self.mutate(account, |record| match record.hwid_lock {
             Some(lock) => (lock, false),
             None => {
-                record.hwid_lock = Some(hwid_hash);
-                (hwid_hash, true)
+                if record.hwid_components.is_some() {
+                    // A component-bound account must not also bind the
+                    // strict flavor: stolen credentials could bypass the
+                    // fuzzy machine lock by switching protocols. Report a
+                    // lock guaranteed to differ so the caller rejects with
+                    // hwid_mismatch; the admin reset clears both stores,
+                    // so migration stays possible via a reset.
+                    let mut foreign = hwid_hash;
+                    foreign[0] ^= 0xff;
+                    (foreign, false)
+                } else {
+                    record.hwid_lock = Some(hwid_hash);
+                    (hwid_hash, true)
+                }
             }
         })
         .await
     }
 
+    async fn match_hwid(
+        &self,
+        account: &str,
+        probe: &HwidProbe,
+    ) -> Result<Option<HwidVerdict>, BackendError> {
+        let verdict = self
+            .mutate(account, |record| match &record.hwid_components {
+                None => {
+                    if record.hwid_lock.is_some() {
+                        // A legacy-locked account must not bind the fuzzy
+                        // flavor either: the first component probe from a
+                        // different machine would otherwise rebind. The
+                        // admin reset clears both stores, so migration
+                        // stays possible via a reset.
+                        (HwidVerdict::Rejected, false)
+                    } else {
+                        record.hwid_components = Some(probe.components.clone());
+                        (HwidVerdict::Accepted { updated: true }, true)
+                    }
+                }
+                Some(stored) => match match_hwid_probe(stored, &probe.components) {
+                    HwidMatch::Accepted { healed, .. } => {
+                        let updated = healed != *stored;
+                        if updated {
+                            record.hwid_components = Some(healed);
+                        }
+                        (HwidVerdict::Accepted { updated }, updated)
+                    }
+                    HwidMatch::Rejected { .. } => (HwidVerdict::Rejected, false),
+                },
+            })
+            .await?;
+        Ok(Some(verdict.unwrap_or(HwidVerdict::Unknown)))
+    }
+
+    async fn hwid_components(
+        &self,
+        account: &str,
+    ) -> Result<Option<Vec<keystone_core::HwidComponent>>, BackendError> {
+        let file = self.current().await?;
+        Ok(file
+            .accounts
+            .iter()
+            .find(|a| a.name == account)
+            .and_then(|a| a.hwid_components.clone()))
+    }
+
     async fn clear_hwid_lock(&self, account: &str) -> Result<Option<bool>, BackendError> {
         self.mutate(account, |record| {
             let was_locked = record.hwid_lock.take().is_some();
-            (was_locked, was_locked)
+            let had_components = record.hwid_components.take().is_some();
+            let held = was_locked || had_components;
+            (held, held)
         })
         .await
     }
@@ -315,7 +377,7 @@ impl EntitlementSource for LocalAccounts {
             .iter()
             .find(|a| a.name == account)
             .map(|a| AccountSummary {
-                hwid_locked: a.hwid_lock.is_some(),
+                hwid_locked: a.hwid_lock.is_some() || a.hwid_components.is_some(),
                 grants: a
                     .entitlements
                     .iter()
