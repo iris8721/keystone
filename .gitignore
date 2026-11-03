@@ -15,6 +15,9 @@ keystone.env
 payloads/
 downloads.jsonl
 
+# Local PoC harness (keys, provisioning scratch, compiled artifacts)
+.poc/
+
 # Editor / OS
 .DS_Store
 .idea/
